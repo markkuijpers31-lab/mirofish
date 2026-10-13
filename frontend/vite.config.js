@@ -14,6 +14,9 @@ export default defineConfig({
   server: {
     port: 3000,
     open: true,
+    allowedHosts: [
+      'mirofish.imarkee.nl'
+    ],
     proxy: {
       '/api': {
         target: 'http://localhost:5001',
