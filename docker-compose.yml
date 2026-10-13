@@ -1,6 +1,9 @@
 services:
   mirofish:
-    image: ghcr.io/666ghj/mirofish:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # image: ghcr.io/666ghj/mirofish:latest
     # Mirror for faster pulling (replace the address above if pulling is slow)
     # image: ghcr.nju.edu.cn/666ghj/mirofish:latest
     container_name: mirofish
