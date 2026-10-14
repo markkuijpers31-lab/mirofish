@@ -273,3 +273,64 @@ def test_tool_call_parser_accepts_prompted_format(uploads, wrapper):
     response = f'Thought\n<{wrapper}>{{"name": "simulation_actions", "parameters": {{"persona": "C01"}}}}</{wrapper}>'
     calls = agent._parse_tool_calls(response)
     assert calls == [{"name": "simulation_actions", "parameters": {"persona": "C01"}}]
+
+
+def _prompt_tool_example(prompt):
+    """The tool-call example a prompt shows the model, e.g. <tool>{...}</tool>"""
+    match = re.search(r"(<(\w+)>\s*(\{.*?\})\s*</\2>)", prompt, re.DOTALL)
+    assert match, "prompt no longer contains a tool-call example"
+    return match.group(2), match.group(3)
+
+
+def test_every_prompted_tool_syntax_is_understood_by_the_parser():
+    from app.services.report_agent import CHAT_SYSTEM_PROMPT_TEMPLATE, SECTION_SYSTEM_PROMPT_TEMPLATE
+
+    section_prompt = SECTION_SYSTEM_PROMPT_TEMPLATE.format(
+        report_title="t", report_summary="s", simulation_requirement="r", section_title="x", tools_description=""
+    )
+    chat_prompt = CHAT_SYSTEM_PROMPT_TEMPLATE.format(
+        simulation_requirement="r", report_content="c", tools_description=""
+    )
+    agent = ReportAgent.__new__(ReportAgent)
+    for prompt in (section_prompt, chat_prompt):
+        tag, example = _prompt_tool_example(prompt)
+        example = example.replace("tool_name", "simulation_actions")
+        response = f"Thought: I need evidence\n<{tag}>\n{example}\n</{tag}>"
+        assert agent._parse_tool_calls(response) == [
+            {"name": "simulation_actions", "parameters": {"param_name": "param_value"}}
+        ], tag
+
+
+class PromptFollowingLLM(FakeLLM):
+    """Calls tools with exactly the syntax the section prompt teaches, and records what it sees"""
+
+    def __init__(self):
+        super().__init__()
+        self.observations = []
+
+    def chat(self, messages, temperature=0.5, max_tokens=8192, response_format=None):
+        tag, _ = _prompt_tool_example(messages[0]["content"])
+        seen = [m["content"] for m in messages if m["role"] == "user" and "Observation" in m["content"]]
+        if not seen:
+            return f'Thought: look at the raw actions\n<{tag}>\n{{"name": "simulation_actions", "parameters": {{"query": "expensive"}}}}\n</{tag}>'
+        self.observations.append(seen[-1])
+        return "Final Answer: In the simulation, C01 found the plan too expensive [TW-00002]."
+
+
+def test_prompted_tool_call_reaches_the_tool_and_its_result_reaches_the_report(uploads):
+    run_id = _completed_run()
+    llm = PromptFollowingLLM()
+    agent = ReportAgent(
+        graph_id="graph_test", simulation_id="sim_test", simulation_requirement="req",
+        llm_client=llm, graph_tools=EmptyGraphTools(), run_id=run_id,
+    )
+    report = agent.generate_report(report_id="report_parse")
+
+    assert report.status == ReportStatus.COMPLETED, report.error
+    # The tool really ran on the raw actions and its output went back to the model
+    assert llm.observations, "the tool call was never executed"
+    assert "TW-00002" in llm.observations[0] and "too expensive" in llm.observations[0]
+    folder = ReportManager._get_report_folder("report_parse")
+    log_lines = [json.loads(line) for line in open(os.path.join(folder, "agent_log.jsonl"))]
+    assert any(l["action"] == "tool_call" and l["details"]["tool_name"] == "simulation_actions" for l in log_lines)
+    assert "[TW-00002]" in report.markdown_content

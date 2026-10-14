@@ -43,9 +43,10 @@ cd backend && uv run pytest path/to/test_file.py  # single file
 cd backend && uv run pytest path/to/test_file.py::test_name  # single test
 cd frontend && npm test                           # frontend unit tests
 ```
-Some older tests (`test_ontology_*`, `test_platform_profiles`,
-`test_simulation_prepare_failure`) fail since the Zep removal; they describe
-behaviour that was lost then and are not related to the run model.
+The full suite must stay green. `tests/test_e2e_pipeline.py` runs the whole
+pipeline (upload → ontology → local graph → prepare → fake OASIS run → report →
+ZIP export) without any external service; `conftest.py` blocks real LLM and
+embedding calls.
 `backend/scripts/test_profile_format.py` is a **manual print-based script**, not
 a pytest test — run it with `uv run python scripts/test_profile_format.py`.
 

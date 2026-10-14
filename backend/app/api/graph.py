@@ -244,14 +244,29 @@ def generate_ontology():
         ProjectManager.save_extracted_text(project.project_id, all_text)
         logger.info(f"Text extraction complete, total {len(all_text)} characters")
 
-        # Generate ontology
+        # Generate ontology. On failure the project is kept (sources stay
+        # auditable) but marked FAILED, so it can never be used to build a graph.
         logger.info("Calling LLM to generate ontology definition...")
-        generator = OntologyGenerator()
-        ontology = generator.generate(
-            document_texts=document_texts,
-            simulation_requirement=simulation_requirement,
-            additional_context=additional_context if additional_context else None,
-        )
+        try:
+            generator = OntologyGenerator()
+            ontology = generator.generate(
+                document_texts=document_texts,
+                simulation_requirement=simulation_requirement,
+                additional_context=additional_context if additional_context else None,
+            )
+        except Exception as ontology_error:
+            logger.error(f"Ontology generation failed for {project.project_id}: {ontology_error}")
+            project.status = ProjectStatus.FAILED
+            project.error = f"Ontology generation failed: {ontology_error}"
+            ProjectManager.save_project(project)
+            return jsonify(
+                {
+                    "success": False,
+                    "error": project.error,
+                    "project_id": project.project_id,
+                    "traceback": traceback.format_exc(),
+                }
+            ), 500
 
         # Save ontology to project
         entity_count = len(ontology.get("entity_types", []))
@@ -463,12 +478,23 @@ def build_graph():
                     )
 
                 extractor.extract_and_store(chunks, extract_progress)
+                build_logger.info(f"[{task_id}] Extraction stats: {extractor.stats}")
 
                 # Get graph data
                 task_manager.update_task(
                     task_id, message=t("progress.fetchingGraphData"), progress=95
                 )
                 graph_data = builder.get_graph_data(graph_id)
+
+                # An empty graph cannot produce personas: fail clearly instead of
+                # reporting success and failing later in simulation preparation
+                if graph_data.get("node_count", 0) == 0:
+                    raise ValueError(
+                        "No entities could be extracted from the source documents "
+                        f"({extractor.stats['chunks_failed']}/{extractor.stats['chunks_total']} "
+                        "chunks failed in the LLM extraction step). Check the LLM settings "
+                        "and the extracted text of the uploaded files."
+                    )
 
                 # Update project status
                 project.status = ProjectStatus.GRAPH_COMPLETED

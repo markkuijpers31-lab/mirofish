@@ -179,9 +179,54 @@ class LocalGraphStore:
             row = conn.execute(
                 "SELECT ontology FROM graph_meta WHERE graph_id=?", (self.graph_id,)
             ).fetchone()
-            if row:
+            if not row or not row["ontology"]:
+                return {}
+            try:
                 return json.loads(row["ontology"])
-            return {}
+            except (TypeError, ValueError):
+                # Graphs built before the JSON fix stored a Python repr
+                logger.warning(f"Unreadable ontology metadata in graph {self.graph_id}; ignoring it")
+                return {}
+
+    def set_ontology(self, ontology: Dict[str, Any]):
+        """Persist the ontology as JSON (creates the meta row if missing)"""
+        payload = json.dumps(ontology or {}, ensure_ascii=False)
+        with _connect(self.graph_id) as conn:
+            updated = conn.execute(
+                "UPDATE graph_meta SET ontology=? WHERE graph_id=?",
+                (payload, self.graph_id),
+            ).rowcount
+            if not updated:
+                conn.execute(
+                    "INSERT INTO graph_meta (graph_id, name, description, ontology, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
+                    (self.graph_id, self.graph_id, "", payload),
+                )
+            conn.commit()
+
+    def update_node(
+        self,
+        node_uuid: str,
+        name: Optional[str] = None,
+        summary: Optional[str] = None,
+        attributes: Optional[Dict[str, Any]] = None,
+    ):
+        """Update mutable node fields (used when merging name variants of one entity)"""
+        sets, params = [], []
+        if name is not None:
+            sets.append("name=?")
+            params.append(name)
+        if summary is not None:
+            sets.append("summary=?")
+            params.append(summary)
+        if attributes is not None:
+            sets.append("attributes=?")
+            params.append(json.dumps(attributes, ensure_ascii=False))
+        if not sets:
+            return
+        params.append(node_uuid)
+        with _connect(self.graph_id) as conn:
+            conn.execute(f"UPDATE nodes SET {', '.join(sets)} WHERE uuid=?", params)
+            conn.commit()
 
     def add_episode(self, data: str, episode_type: str = "text") -> str:
         ep_uuid = str(uuid.uuid4())
@@ -307,14 +352,14 @@ class LocalGraphStore:
     def get_all_nodes(self) -> List[LocalNode]:
         with _connect(self.graph_id) as conn:
             rows = conn.execute(
-                "SELECT * FROM nodes WHERE graph_id=?", (self.graph_id,)
+                "SELECT * FROM nodes WHERE graph_id=? ORDER BY rowid", (self.graph_id,)
             ).fetchall()
             return [self._row_to_node(r) for r in rows]
 
     def get_all_edges(self) -> List[LocalEdge]:
         with _connect(self.graph_id) as conn:
             rows = conn.execute(
-                "SELECT * FROM edges WHERE graph_id=?", (self.graph_id,)
+                "SELECT * FROM edges WHERE graph_id=? ORDER BY rowid", (self.graph_id,)
             ).fetchall()
             return [self._row_to_edge(r) for r in rows]
 

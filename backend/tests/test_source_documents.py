@@ -98,3 +98,44 @@ def test_legacy_project_text_is_split_per_document(uploads):
     )
     docs = ProjectManager.get_source_documents(project.project_id)
     assert [(d["original_filename"], d["text"]) for d in docs] == [("a.md", "Alpha text"), ("b.txt", "Beta text")]
+
+
+def test_source_pipeline_from_upload_to_report_evidence(uploads, client, monkeypatch):
+    files = [
+        ("interviews.txt", b"Plain text interview notes about campsites."),
+        ("product.md", "# Product\nOffline maps and a 4.99 premium plan.".encode()),
+        ("pricing.pdf", _pdf_bytes("Pricing sheet: premium 4.99 per month")),
+    ]
+    project_id = _upload(client, monkeypatch, files)
+
+    # Project: original names, per-file text, additional context, originals on disk
+    project = ProjectManager.get_project(project_id)
+    assert [f["filename"] for f in project.files] == ["interviews.txt", "product.md", "pricing.pdf"]
+    assert project.additional_context == "Focus on pricing"
+    docs = ProjectManager.get_source_documents(project_id)
+    assert all(d["text"].strip() and d["extraction_status"] == "ok" for d in docs)
+    assert all(d["original_path"] and os.path.exists(d["original_path"]) for d in docs)
+
+    # Run snapshot: same sources, same text, manifest per file
+    make_prepared_simulation(project_id=project_id)
+    record = RunStore.create_run("sim_test")
+    run_dir = RunStore.run_dir("sim_test", record.run_id)
+    import json
+
+    manifest = json.load(open(os.path.join(run_dir, "sources", "manifest.json")))
+    assert [d["original_filename"] for d in manifest["documents"]] == [d["original_filename"] for d in docs]
+    for entry, doc in zip(manifest["documents"], docs):
+        assert entry["extraction_status"] == "ok"
+        assert entry["text_length"] == len(doc["text"])
+        with open(os.path.join(run_dir, "sources", entry["text_file"]), encoding="utf-8") as f:
+            assert f.read() == doc["text"]
+        assert os.path.exists(os.path.join(run_dir, "sources", "originals", entry["original_file"]))
+    assert record.snapshot["sources"] == 3
+
+    # Report evidence loader sees each source separately
+    evidence = RunEvidence.load("sim_test", record.run_id)
+    assert evidence.sources_origin == "run_snapshot"
+    assert [s["original_filename"] for s in evidence.sources] == ["interviews.txt", "product.md", "pricing.pdf"]
+    assert "premium 4.99" in evidence.source_excerpts(name="pricing")
+    assert "Offline maps" in evidence.source_excerpts(name="product.md")
+    assert "Focus on pricing" in evidence.brief_text

@@ -105,6 +105,7 @@ Click the image to watch MiroFish's deep prediction of the lost ending based on 
   sources, brief, personas, raw action logs, normalized evidence, the report (Markdown +
   JSON) and report-agent logs. Everything lives under `backend/uploads`, which is the
   persistent volume in Docker.
+- See [docs/COOLIFY_E2E_TEST.md](docs/COOLIFY_E2E_TEST.md) for a step-by-step first end-to-end test.
 
 ## 🚀 Quick Start
 

@@ -11,10 +11,23 @@ import pytest
 
 from app.config import Config
 from app.models.project import ProjectManager
+from app.services import local_graph_store as graph_store_module
 from app.services import simulation_runner as runner_module
 from app.services.report_agent import ReportManager
 from app.services.simulation_manager import SimulationManager
 from app.services.simulation_runner import SimulationRunner
+
+
+@pytest.fixture(autouse=True)
+def offline_llm_environment(monkeypatch):
+    """Tests never call a real LLM or embedding endpoint"""
+    from app.services import graph_tools as graph_tools_module
+    from app.services import local_graph_extractor as extractor_module
+    from app.utils import embeddings as embeddings_module
+
+    monkeypatch.setattr(Config, "LLM_API_KEY", Config.LLM_API_KEY or "test-key")
+    for module in (embeddings_module, extractor_module, graph_tools_module):
+        monkeypatch.setattr(module, "embed", lambda *args, **kwargs: None)
 
 
 @pytest.fixture
@@ -29,6 +42,7 @@ def uploads(tmp_path, monkeypatch):
     monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(sims))
     monkeypatch.setattr(ProjectManager, "PROJECTS_DIR", str(root / "projects"))
     monkeypatch.setattr(ReportManager, "REPORTS_DIR", str(root / "reports"))
+    monkeypatch.setattr(graph_store_module, "GRAPH_DIR", str(root / "graphs"))
     for attr in ("_run_states", "_processes", "_active_runs", "_action_queues",
                  "_monitor_threads", "_stdout_files", "_stderr_files", "_graph_memory_enabled"):
         monkeypatch.setattr(SimulationRunner, attr, {})
@@ -163,6 +177,8 @@ class FakePopen:
 
     instances = []
     finish_immediately = True
+    # Optional {platform: [actions]} written instead of default_actions()
+    actions = None
 
     def __init__(self, cmd, cwd=None, env=None, **kwargs):
         self.cmd = cmd
@@ -175,7 +191,8 @@ class FakePopen:
         run_id = self.env.get("MIROFISH_RUN_ID")
         if FakePopen.finish_immediately:
             for platform in ("twitter", "reddit"):
-                write_actions(cwd, platform, default_actions(platform), run_id=run_id)
+                actions = (FakePopen.actions or {}).get(platform) if FakePopen.actions else default_actions(platform)
+                write_actions(cwd, platform, actions or [], run_id=run_id)
             self.finish(0)
 
     def finish(self, code=0):
@@ -200,6 +217,7 @@ class FakePopen:
 def fake_popen(monkeypatch):
     FakePopen.instances = []
     FakePopen.finish_immediately = True
+    FakePopen.actions = None
     monkeypatch.setattr(runner_module.subprocess, "Popen", FakePopen)
     real_sleep = runner_module.time.sleep
     monkeypatch.setattr(runner_module.time, "sleep", lambda _s: real_sleep(0.01))

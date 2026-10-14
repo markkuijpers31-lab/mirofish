@@ -277,7 +277,8 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         # - running: currently running, preparation was done earlier
         # - completed: run completed, preparation was done earlier
         # - stopped: stopped, preparation was done earlier
-        # - failed: run failed (but preparation was done)
+        # "failed" is a failed preparation: never startable, even if an older
+        # simulation_config.json is still on disk.
         prepared_statuses = [
             "ready",
             "preparing",
@@ -285,9 +286,9 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
             "paused",
             "completed",
             "stopped",
-            "failed",
         ]
-        if status in prepared_statuses and config_generated:
+        profiles_generated = state_data.get("profiles_generated", config_generated)
+        if status in prepared_statuses and config_generated and profiles_generated:
             # Get file statistics
             profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")
             config_file = os.path.join(simulation_dir, "simulation_config.json")
@@ -495,8 +496,12 @@ def prepare_simulation():
             metadata={"simulation_id": simulation_id, "project_id": state.project_id},
         )
 
-        # Update simulation state (including pre-fetched entity count)
+        # Update simulation state (including pre-fetched entity count). The
+        # previous preparation is invalid until the new one completes.
         state.status = SimulationStatus.PREPARING
+        state.profiles_generated = False
+        state.config_generated = False
+        state.error = None
         manager._save_simulation_state(state)
 
         # Capture locale before spawning background thread
@@ -1007,9 +1012,18 @@ def get_simulation_profiles(simulation_id: str):
         platform: Platform type (reddit/twitter, default reddit)
     """
     try:
-        platform = request.args.get("platform", "reddit")
+        platform = request.args.get("platform")
 
         manager = SimulationManager()
+        state = manager.get_simulation(simulation_id)
+        if not state:
+            return jsonify(
+                {"success": False, "error": t("api.simulationNotFound", id=simulation_id)}
+            ), 404
+        if platform is None:
+            platform = state.get_default_platform()
+        if platform not in ("reddit", "twitter"):
+            return jsonify({"success": False, "error": f"Unsupported platform: {platform}"}), 400
         profiles = manager.get_profiles(simulation_id, platform=platform)
 
         return jsonify(
@@ -1067,6 +1081,8 @@ def get_simulation_profiles_realtime(simulation_id: str):
 
     try:
         platform = request.args.get("platform", "reddit")
+        if platform not in ("reddit", "twitter"):
+            return jsonify({"success": False, "error": f"Unsupported platform: {platform}"}), 400
 
         # Get simulation directory
         sim_dir = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
@@ -1107,9 +1123,13 @@ def get_simulation_profiles_realtime(simulation_id: str):
                 logger.warning(f"Failed to read profiles file (may be writing): {e}")
                 profiles = []
 
-        # Check if generating (via state.json)
+        # Check if generating (via state.json); a failed preparation is
+        # reported explicitly so the UI can stop polling and show the error
         is_generating = False
         total_expected = None
+        status = None
+        error = None
+        profiles_generated = False
 
         state_file = os.path.join(sim_dir, "state.json")
         if os.path.exists(state_file):
@@ -1119,6 +1139,10 @@ def get_simulation_profiles_realtime(simulation_id: str):
                     status = state_data.get("status", "")
                     is_generating = status == "preparing"
                     total_expected = state_data.get("entities_count")
+                    error = state_data.get("error")
+                    profiles_generated = state_data.get(
+                        "profiles_generated", state_data.get("config_generated", False)
+                    )
             except Exception:
                 pass
 
@@ -1131,6 +1155,9 @@ def get_simulation_profiles_realtime(simulation_id: str):
                     "count": len(profiles),
                     "total_expected": total_expected,
                     "is_generating": is_generating,
+                    "status": status,
+                    "error": error,
+                    "profiles_generated": profiles_generated,
                     "file_exists": file_exists,
                     "file_modified_at": file_modified_at,
                     "profiles": profiles,
@@ -1208,6 +1235,9 @@ def get_simulation_config_realtime(simulation_id: str):
         is_generating = False
         generation_stage = None
         config_generated = False
+        profiles_generated = False
+        status = None
+        error = None
 
         state_file = os.path.join(sim_dir, "state.json")
         if os.path.exists(state_file):
@@ -1215,16 +1245,20 @@ def get_simulation_config_realtime(simulation_id: str):
                 with open(state_file, "r", encoding="utf-8") as f:
                     state_data = json.load(f)
                     status = state_data.get("status", "")
+                    error = state_data.get("error")
                     is_generating = status == "preparing"
                     config_generated = state_data.get("config_generated", False)
+                    profiles_generated = state_data.get("profiles_generated", config_generated)
 
                     # Determine current phase
                     if is_generating:
-                        if state_data.get("profiles_generated", False):
+                        if profiles_generated:
                             generation_stage = "generating_config"
                         else:
                             generation_stage = "generating_profiles"
-                    elif status == "ready":
+                    elif status == "failed":
+                        generation_stage = "failed"
+                    elif status == "ready" or config_generated:
                         generation_stage = "completed"
             except Exception:
                 pass
@@ -1236,12 +1270,17 @@ def get_simulation_config_realtime(simulation_id: str):
             "file_modified_at": file_modified_at,
             "is_generating": is_generating,
             "generation_stage": generation_stage,
+            "status": status,
+            "error": error,
+            "profiles_generated": profiles_generated,
             "config_generated": config_generated,
-            "config": config,
+            # A config file left over from an earlier preparation is not valid
+            # while the current preparation has not (successfully) finished
+            "config": config if config_generated else None,
         }
 
         # If config exists, extract key statistics
-        if config:
+        if config and config_generated:
             response_data["summary"] = {
                 "total_agents": len(config.get("agent_configs", [])),
                 "simulation_hours": config.get("time_config", {}).get(
