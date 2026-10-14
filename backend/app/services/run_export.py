@@ -19,11 +19,14 @@ README = """# MiroFish run export
 This archive contains the complete evidence of one simulation run (execution).
 
 - run/            run metadata (run.json), runner state and the simulation process log
-- config/         simulation configuration used by this run
-- personas/       agent profiles and the normalized persona index (canonical IDs)
+- config/         simulation configuration, agent selection and the private experiment plan of this run
+- personas/       agent profiles, the agent roster (active agents with simulation/evidence roles and
+                  context-only graph entities) and the normalized persona index (canonical IDs)
 - sources/        source documents (extracted text + originals when available) and their manifest
 - assessment/     assessment brief and the spec derived from it (personas, hypotheses, funnel fields)
-- actions/        raw Twitter and Reddit action logs of this run (actions.jsonl)
+- actions/        raw Twitter and Reddit action logs of this run (actions.jsonl); every action has an
+                  origin (agent_generated / system_seed / researcher_instruction), private instruction
+                  deliveries are logged as events
 - evidence/       normalized evidence (every action with its reference, e.g. TW-00012)
 - report/         final report (Markdown + JSON), sections and report-agent logs
 
@@ -98,6 +101,9 @@ def build_run_bundle(
     # config/
     add_file("config/simulation_config.json", os.path.join(run_dir, "simulation_config.json"))
     add_file("config/simulation_state.json", os.path.join(sim_dir, "state.json"))
+    add_file("config/agent_selection.json", os.path.join(run_dir, "agent_selection.json"))
+    add_file("config/experiment_plan.json", os.path.join(run_dir, "experiment_plan.json"))
+    add_file("personas/agent_roster.json", os.path.join(run_dir, "agent_roster.json"))
 
     # personas/
     add_file("personas/reddit_profiles.json", os.path.join(run_dir, "reddit_profiles.json"))

@@ -62,8 +62,16 @@ class PlatformActionLogger:
         action_args: Optional[Dict[str, Any]] = None,
         result: Optional[str] = None,
         success: bool = True,
+        origin: str = "agent_generated",
+        origin_flag: Optional[str] = None,
     ):
-        """Log an action"""
+        """
+        Log an action
+
+        origin: agent_generated (the agent's own LLM step), system_seed (initial
+        posts published by the system) or researcher_instruction (content that
+        reproduces a private instruction). Only agent_generated is behavioural evidence.
+        """
         entry = {
             "round": round_num,
             "timestamp": datetime.now().isoformat(),
@@ -73,8 +81,27 @@ class PlatformActionLogger:
             "action_args": action_args or {},
             "result": result,
             "success": success,
+            "origin": origin,
         }
+        if origin_flag:
+            entry["origin_flag"] = origin_flag
 
+        _write_entry(self.log_path, entry)
+
+    def log_event(self, event_type: str, round_num: Optional[int] = None, origin: str = "orchestration", **fields):
+        """
+        Log a non-action event (private instruction delivery, stage completion,
+        rejected seed post). Events are inspectable but never counted as actions.
+        """
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "event_type": event_type,
+            "origin": origin,
+            "platform": self.platform,
+        }
+        if round_num is not None:
+            entry["round"] = round_num
+        entry.update({k: v for k, v in fields.items() if v is not None})
         _write_entry(self.log_path, entry)
 
     def log_round_start(self, round_num: int, simulated_hour: int):

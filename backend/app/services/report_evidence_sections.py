@@ -5,8 +5,9 @@ Evidence-bound report sections: per-persona funnel analysis, hypothesis assessme
 import json
 from typing import Any, Dict, List, Optional
 
+from .agent_selection import EVIDENCE_TARGET_CONSUMER
 from .assessment_spec import AssessmentSpec
-from .run_evidence import RunEvidence
+from .run_evidence import CONSUMER_METRIC_SCOPE, RunEvidence
 
 PERSONA_SECTION_TITLE = "Persona Analysis"
 HYPOTHESIS_SECTION_TITLE = "Hypothesis Assessment"
@@ -38,7 +39,8 @@ Every action has a reference like [TW-00012] (Twitter) or [RD-00003] (Reddit).
 
 Rules:
 - Use ONLY the action list as evidence of what the persona did. Brief and product documents are
-  context, never evidence of behaviour.
+  context, never evidence of behaviour. The list holds only the persona's own (agent-generated)
+  actions; seed posts and private research instructions are excluded by design.
 - For each funnel field decide: "observed" (clearly shown by cited actions), "ambiguous" (actions
   touch on it but do not settle it) or "missing" (not shown). If in doubt, use "missing".
 - Every "observed" or "ambiguous" field MUST cite the refs that show it. Never cite refs that are
@@ -60,6 +62,9 @@ actions, each with a reference like [TW-00012] or [RD-00003].
 
 Rules:
 - Only simulated actions count as evidence. Cite their refs; never cite refs not provided.
+- Each action shows [simulation_role/evidence_role]. Conversion, adoption or acquisition claims may
+  only rest on actions of evidence role target_consumer. Existing users, advocates and platform
+  accounts can show influence on prospects, but never count as conversions.
 - verdict: "supported", "contradicted", "mixed" or "insufficient_evidence".
   Use "insufficient_evidence" whenever the simulation does not clearly speak to the hypothesis.
 - Keep evidence against the hypothesis even when the verdict is "supported".
@@ -128,12 +133,18 @@ class StructuredReportBuilder:
             self.log.warning(msg)
 
     def target_persona_ids(self) -> List[str]:
-        """Persona ids to analyse: the brief's ids, else every simulated persona"""
+        """
+        Persona ids to analyse: the brief's ids, else the target consumers of the
+        selected population (every persona for runs without recorded roles)
+        """
         if self.spec.persona_ids:
             return list(self.spec.persona_ids)
         if not self.evidence:
             return []
-        return sorted(self.evidence.persona_index.personas.keys())
+        personas = sorted(self.evidence.persona_index.personas.keys())
+        if self.evidence.roles_source == "legacy_default":
+            return personas
+        return [cid for cid in personas if self.evidence.persona_evidence_role(cid) == EVIDENCE_TARGET_CONSUMER]
 
     def _context_documents(self, budget: int = 3000) -> str:
         if not self.evidence or not self.evidence.sources:
@@ -173,10 +184,13 @@ class StructuredReportBuilder:
                     present=False, counts={"total": 0},
                 ))
                 continue
-            actions = self.evidence.persona_actions(cid)
+            actions = self.evidence.persona_actions(cid, behavioural_only=True)
             counts = {"total": len(actions)}
             for a in actions:
                 counts[a["platform"]] = counts.get(a["platform"], 0) + 1
+            excluded = len(self.evidence.persona_actions(cid)) - len(actions)
+            if excluded:
+                counts["excluded_non_agent_generated"] = excluded
             if not actions:
                 results.append(self._missing_result(
                     cid, persona["display_name"],
@@ -194,6 +208,11 @@ class StructuredReportBuilder:
                 continue
             llm_calls += 1
             results.append(self._analyse_persona_llm(cid, persona, actions, counts))
+        for r in results:
+            if self.evidence and r.get("present_in_simulation"):
+                r["simulation_role"] = self.evidence.persona_simulation_role(r["canonical_id"])
+                r["evidence_role"] = self.evidence.persona_evidence_role(r["canonical_id"])
+                r["counts_in_conversion_metrics"] = r["evidence_role"] == EVIDENCE_TARGET_CONSUMER
         self.persona_results = results
         self._info(f"Persona analysis done: {len(results)} personas, {llm_calls} LLM calls")
         return results
@@ -220,8 +239,8 @@ class StructuredReportBuilder:
             "Product / source documents (context, not evidence of behaviour):",
             self._context_documents(),
             "",
-            f"COMPLETE simulated action list of {cid} ({len(actions)} actions):",
-            self.evidence.persona_transcript(cid),
+            f"COMPLETE agent-generated action list of {cid} ({len(actions)} actions):",
+            self.evidence.persona_transcript(cid, behavioural_only=True),
         ])
         try:
             data = self.llm.chat_json(
@@ -307,10 +326,21 @@ class StructuredReportBuilder:
             count_text = ", ".join(f"{k} {v}" for k, v in counts.items() if k != "total")
             lines.append(f"**{r['canonical_id']} — {_cell(r['display_name'], 120)}**")
             lines.append("")
+            if r.get("evidence_role"):
+                lines.append(
+                    f"Role: {r.get('simulation_role')} · evidence role: {r['evidence_role']}"
+                    + ("" if r.get("counts_in_conversion_metrics") else " (not counted in conversion / adoption metrics)")
+                )
+                lines.append("")
             if not r.get("present_in_simulation"):
                 lines.append("_Not present in the simulation: no agent maps to this ID. Every field is missing._")
             else:
-                lines.append(f"Simulated actions: {counts.get('total', 0)}" + (f" ({count_text})" if count_text else ""))
+                count_text = ", ".join(f"{k} {v}" for k, v in counts.items() if k in ("twitter", "reddit"))
+                lines.append(f"Agent-generated actions: {counts.get('total', 0)}" + (f" ({count_text})" if count_text else ""))
+                if counts.get("excluded_non_agent_generated"):
+                    lines.append(
+                        f"Excluded from behavioural evidence: {counts['excluded_non_agent_generated']} seed / instruction actions"
+                    )
             lines.append("")
             lines.append("| Field | Status | Simulated evidence | Refs |")
             lines.append("|---|---|---|---|")
@@ -332,7 +362,8 @@ class StructuredReportBuilder:
     def assess_hypotheses(self) -> List[Dict[str, Any]]:
         """Assess every hypothesis of the brief against the run's evidence"""
         results = []
-        all_refs = {a["ref"] for a in self.evidence.actions} if self.evidence else set()
+        behavioural = self.evidence.behavioural_actions() if self.evidence else []
+        all_refs = {a["ref"] for a in behavioural}
         persona_summary = [
             {
                 "persona": r["canonical_id"],
@@ -348,25 +379,25 @@ class StructuredReportBuilder:
                 results.append({
                     **h,
                     "verdict": "insufficient_evidence",
-                    "rationale": "This run contains no simulated actions.",
+                    "rationale": "This run contains no agent-generated simulated actions.",
                     "evidence_for": [],
                     "evidence_against": [],
                     "missing_evidence": "Simulated actions relevant to the hypothesis.",
                     "method": "deterministic",
                 })
                 continue
-            relevant = self.evidence.search_actions(query=h["text"], limit=60)
+            relevant = self.evidence.search_actions(query=h["text"], limit=60, scope="behavioural")
             if len(relevant) < 10:
                 seen = {a["ref"] for a in relevant}
-                relevant += [a for a in self.evidence.actions if a["ref"] not in seen][: 60 - len(relevant)]
+                relevant += [a for a in behavioural if a["ref"] not in seen][: 60 - len(relevant)]
             user_prompt = "\n".join([
                 f"Hypothesis {h['id']}: {h['text']}",
                 "",
                 "Per-persona funnel findings (validated):",
                 json.dumps(persona_summary, ensure_ascii=False)[:20000],
                 "",
-                "Aggregate simulation counts (simulation counts, not real-world rates):",
-                json.dumps(self.evidence.stats(), ensure_ascii=False)[:3000],
+                f"Conversion / adoption counts (scope: {CONSUMER_METRIC_SCOPE}; simulation counts, not real-world rates):",
+                json.dumps(self.evidence.consumer_metrics(), ensure_ascii=False)[:3000],
                 "",
                 "Relevant simulated actions:",
                 "\n".join(RunEvidence.format_action(a) for a in relevant),
@@ -477,14 +508,45 @@ class StructuredReportBuilder:
             f"- Twitter actions: {stats['by_platform'].get('twitter', 0)} · Reddit actions: {stats['by_platform'].get('reddit', 0)} · Total: {stats['total_actions']}",
             f"- Action types: {', '.join(f'{k} {v}' for k, v in sorted(stats['by_action_type'].items())) or 'none'}",
         ]
+        origins = stats.get("by_origin", {})
+        lines.append(
+            "- Action origins: " + (", ".join(f"{k} {v}" for k, v in sorted(origins.items())) or "none")
+            + ". Only agent_generated actions are behavioural evidence; seed posts and private research "
+              "instructions stay in the raw logs for inspection."
+        )
+        lines.append(f"- Private instructions delivered (agent memory, never posted): {stats.get('private_instructions_delivered', 0)}")
         for warning in ev.integrity.get("warnings", []):
             lines.append(f"- ⚠️ Integrity: {warning}")
-        lines += ["", "**Personas (canonical IDs)**", "", "| Canonical ID | Display name | Agent IDs | Twitter | Reddit | Total |", "|---|---|---|---|---|---|"]
-        for p in ev.persona_index.to_list():
+        cm = stats.get("consumer_metrics", {})
+        lines += [
+            "",
+            "**Conversion metric scope**",
+            "",
+            f"- Default scope: `{CONSUMER_METRIC_SCOPE}` (roles from: {ev.roles_source})"
+            + (f". {ev.roles_note}" if ev.roles_note else ""),
+            f"- Target-consumer personas: {', '.join(cm.get('target_consumer_personas', [])) or 'none'}",
+            f"- Counted actions: {cm.get('actions', 0)} · excluded by origin: "
+            f"{', '.join(f'{k} {v}' for k, v in cm.get('excluded_by_origin', {}).items()) or 'none'} · "
+            f"excluded by evidence role: {', '.join(f'{k} {v}' for k, v in cm.get('excluded_by_evidence_role', {}).items()) or 'none'}",
+        ]
+        lines += ["", "**Simulation population (canonical IDs)**", "",
+                  "| Canonical ID | Display name | Agent IDs | Simulation role | Evidence role | Twitter | Reddit | Total | Excluded (non-agent) |",
+                  "|---|---|---|---|---|---|---|---|---|"]
+        for p in ev.population():
             c = stats["by_persona"].get(p["canonical_id"], {})
             lines.append(
                 f"| {_cell(p['canonical_id'], 40)} | {_cell(p['display_name'], 80)} | {_cell(', '.join(str(i) for i in p['agent_ids']), 40)} | "
-                f"{c.get('twitter', 0)} | {c.get('reddit', 0)} | {c.get('total', 0)} |"
+                f"{_cell(p['simulation_role'], 30)} | {_cell(p['evidence_role'], 30)} | "
+                f"{c.get('twitter', 0)} | {c.get('reddit', 0)} | {c.get('total', 0)} | {p['excluded_actions']} |"
+            )
+        if ev.roster:
+            context = ev.roster.get("context_entities", [])
+            lines.append("")
+            lines.append(
+                f"Population: {len(ev.roster.get('active_agents', []))} active agents / "
+                f"{len(ev.roster.get('active_agents', [])) + len(context)} graph entities. "
+                f"{len(context)} context-only entities (in the knowledge graph, never simulation accounts): "
+                f"{_cell(', '.join(c.get('name', '') for c in context[:40]), 600)}"
             )
         not_present = [pid for pid in self.spec.persona_ids if pid not in ev.persona_index.personas]
         if not_present:

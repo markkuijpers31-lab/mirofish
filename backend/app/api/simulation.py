@@ -10,6 +10,9 @@ from flask import request, jsonify, send_file
 
 from . import simulation_bp
 from ..config import Config
+from ..services.agent_selection import (
+    DEFAULT_ROLE_CATALOG, AgentSelectionStore, apply_selection_update, build_selection_view,
+)
 from ..services.entity_reader import EntityReader
 from ..services.oasis_profile_generator import OasisProfileGenerator
 from ..services.simulation_manager import SimulationManager, SimulationStatus
@@ -136,6 +139,267 @@ def get_entities_by_type(graph_id: str, entity_type: str):
         return jsonify(
             {"success": False, "error": str(e), "traceback": traceback.format_exc()}
         ), 500
+
+
+# ============== Agent selection & experiment plan ==============
+
+
+def _active_run_exists(simulation_id: str) -> bool:
+    """Whether a run of the simulation is currently executing"""
+    current = SimulationRunner.reconcile_run(simulation_id, RunStore.get_current_run(simulation_id))
+    return bool(current and current.status == RunStatus.RUNNING) or SimulationRunner.is_process_alive(simulation_id)
+
+
+def _prepare_task_running(state) -> bool:
+    """Whether the simulation's prepare task is still pending/processing"""
+    from ..models.task import TaskManager, TaskStatus
+
+    if state.status != SimulationStatus.PREPARING or not state.prepare_task_id:
+        return False
+    task = TaskManager().get_task(state.prepare_task_id)
+    return bool(task and task.status in (TaskStatus.PENDING, TaskStatus.PROCESSING))
+
+
+def _population_status(simulation_id: str, state, saved: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Relation between the saved selection, the prepared roster and the simulation state
+
+    prepared  = profiles + config exist for the current population
+    in_sync   = the prepared roster was built from the saved (confirmed) selection
+    legacy    = prepared before explicit agent selection existed (no roster)
+    """
+    roster = AgentSelectionStore.load_roster(simulation_id)
+    saved = saved if saved is not None else AgentSelectionStore.load(simulation_id)
+    flags_ok = state.profiles_generated and state.config_generated and state.status not in (
+        SimulationStatus.CREATED, SimulationStatus.PREPARING, SimulationStatus.FAILED
+    )
+    in_sync = bool(
+        roster and saved and saved.get("confirmed")
+        and saved.get("selection_hash") == roster.get("selection_hash")
+    )
+    legacy = flags_ok and roster is None and saved is None
+    legacy_agents = 0
+    if legacy:
+        config = SimulationManager().get_simulation_config(simulation_id) or {}
+        legacy_agents = len(config.get("agent_configs", []))
+    return {
+        "prepared": bool(flags_ok and (in_sync or legacy)),
+        "in_sync": in_sync,
+        "legacy_prepared": legacy,
+        "legacy_agents_count": legacy_agents,
+        "selection_confirmed": bool(saved and saved.get("confirmed")),
+        "prepared_selection_hash": roster.get("selection_hash") if roster else None,
+        "roster_summary": roster.get("summary") if roster else None,
+        "prepared_at": roster.get("prepared_at") if roster else None,
+        "preparing": _prepare_task_running(state),
+        "prepare_task_id": state.prepare_task_id,
+        "active_run": _active_run_exists(simulation_id),
+        "status": state.status.value,
+    }
+
+
+def _selection_response(simulation_id: str, state, saved: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    from ..services.research_instructions import load_project_brief
+
+    saved = saved if saved is not None else AgentSelectionStore.load(simulation_id)
+    entities = EntityReader().filter_defined_entities(
+        graph_id=state.graph_id, enrich_with_edges=False
+    ).entities
+    brief = load_project_brief(state.project_id)
+    view = build_selection_view(entities, saved, brief.get("persona_ids"))
+    view.update({
+        "simulation_id": simulation_id,
+        "graph_id": state.graph_id,
+        "population": _population_status(simulation_id, state, saved),
+        "brief_instructions_count": len(brief.get("instructions", [])),
+    })
+    return view
+
+
+def _save_selection(simulation_id: str, state, payload: Dict[str, Any], confirmed_default: bool = False) -> Dict[str, Any]:
+    """
+    Validate + persist a selection; a changed population invalidates the preparation
+
+    Raises:
+        ValueError: invalid selection
+        RuntimeError: population cannot change right now (prepare/run in progress)
+    """
+    if _prepare_task_running(state):
+        raise RuntimeError("Preparation is in progress; wait for it to finish before changing the population")
+    previous = AgentSelectionStore.load(simulation_id)
+    entities = EntityReader().filter_defined_entities(
+        graph_id=state.graph_id, enrich_with_edges=False
+    ).entities
+    payload = dict(payload or {})
+    payload.setdefault("confirmed", confirmed_default)
+    document = apply_selection_update(entities, payload, previous, state.graph_id)
+    roster = AgentSelectionStore.load_roster(simulation_id)
+    changes_population = roster is not None and roster.get("selection_hash") != document["selection_hash"]
+    legacy_prepared = roster is None and state.profiles_generated and state.config_generated
+    invalidates = (changes_population or legacy_prepared) and (state.profiles_generated or state.config_generated)
+    if invalidates and _active_run_exists(simulation_id):
+        raise RuntimeError("A run is executing; stop it before changing the population (existing runs keep their own snapshot)")
+    AgentSelectionStore.save(simulation_id, document)
+    if invalidates:
+        # Prepared profiles belong to the previous population: re-prepare before the next run.
+        # Existing runs are untouched (each holds its own roster snapshot).
+        state.status = SimulationStatus.CREATED
+        state.profiles_generated = False
+        state.config_generated = False
+        SimulationManager()._save_simulation_state(state)
+    get_logger("mirofish.api.simulation").info(
+        f"[{simulation_id}] Agent selection saved: active={sum(1 for e in document['entities'] if e['active'])}/"
+        f"{len(document['entities'])} confirmed={document['confirmed']} invalidated_prepare={bool(invalidates)}"
+    )
+    return {"document": document, "preparation_invalidated": bool(invalidates)}
+
+
+@simulation_bp.route("/<simulation_id>/agent-selection", methods=["GET"])
+def get_agent_selection(simulation_id: str):
+    """
+    The agent selection: every eligible graph entity with its active flag and roles
+
+    Reading never persists anything (an unsaved selection has every entity inactive).
+
+    Returns:
+        {
+            "success": true,
+            "data": {
+                "entities": [{"entity_uuid", "name", "entity_type", "description", "active",
+                              "simulation_role", "evidence_role", "duplicate_of", "possible_duplicates", ...}],
+                "role_catalog": [{"id", "label", "default_evidence_role"}],
+                "evidence_roles": [{"id", "label"}],
+                "summary": {"active_agents": 25, "graph_entities": 67, "context_entities": 42,
+                            "by_simulation_role": [...], "by_evidence_role": [...], "by_entity_type": {...}},
+                "confirmed": true,
+                "population": {"prepared", "in_sync", "legacy_prepared", "preparing", "prepare_task_id", ...}
+            }
+        }
+    """
+    try:
+        state = SimulationManager().get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": t("api.simulationNotFound", id=simulation_id)}), 404
+        return jsonify({"success": True, "data": _selection_response(simulation_id, state)})
+    except Exception as e:
+        logger.error(f"Failed to get agent selection: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@simulation_bp.route("/<simulation_id>/agent-selection", methods=["PUT", "POST"])
+def save_agent_selection(simulation_id: str):
+    """
+    Save the agent selection
+
+    Request (JSON):
+        {
+            "entities": [{"entity_uuid": "...", "active": true,
+                          "simulation_role": "prospect", "evidence_role": "target_consumer"}],
+            "role_catalog": [{"id": "prospect", "label": "Prospect", "default_evidence_role": "target_consumer"}],
+            "confirmed": true      // confirmed selections can be prepared
+        }
+
+    Entities missing from the request keep their previous decision. Changing the
+    active population of a prepared simulation invalidates the preparation
+    (preparation_invalidated=true); existing runs keep their own snapshot.
+
+    Returns:
+        {"success": true, "data": {...same as GET..., "preparation_invalidated": false}}
+    """
+    try:
+        state = SimulationManager().get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": t("api.simulationNotFound", id=simulation_id)}), 404
+        try:
+            result = _save_selection(simulation_id, state, request.get_json() or {})
+        except ValueError as e:
+            return jsonify({"success": False, "error": str(e)}), 400
+        except RuntimeError as e:
+            return jsonify({"success": False, "error": str(e)}), 409
+        data = _selection_response(simulation_id, state, result["document"])
+        data["preparation_invalidated"] = result["preparation_invalidated"]
+        return jsonify({"success": True, "data": data})
+    except Exception as e:
+        logger.error(f"Failed to save agent selection: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@simulation_bp.route("/<simulation_id>/experiment-plan", methods=["GET"])
+def get_experiment_plan(simulation_id: str):
+    """
+    Private experiment plan (run-scoped stages delivered privately to agents)
+
+    Without a saved plan, the suggestion derived from the assessment brief is
+    returned (saved=false); it is what prepare uses until a plan is saved.
+
+    Returns:
+        {"success": true, "data": {"stages": [...], "saved": false,
+         "condition_types": [...], "completion_types": [...]}}
+    """
+    from ..services.research_instructions import (
+        COMPLETION_TYPES, CONDITION_TYPES, ExperimentPlanStore, load_project_brief, plan_from_brief,
+    )
+
+    try:
+        state = SimulationManager().get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": t("api.simulationNotFound", id=simulation_id)}), 404
+        plan = ExperimentPlanStore.load(simulation_id)
+        if plan is None:
+            brief = load_project_brief(state.project_id)
+            plan = plan_from_brief(brief["brief_text"], brief["persona_ids"])
+        return jsonify({"success": True, "data": {
+            **plan,
+            "condition_types": list(CONDITION_TYPES),
+            "completion_types": list(COMPLETION_TYPES),
+        }})
+    except Exception as e:
+        logger.error(f"Failed to get experiment plan: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@simulation_bp.route("/<simulation_id>/experiment-plan", methods=["PUT", "POST"])
+def save_experiment_plan(simulation_id: str):
+    """
+    Save the private experiment plan
+
+    Request (JSON):
+        {
+            "stages": [{
+                "id": "exposure", "name": "Neutral product exposure", "trigger_round": 5,
+                "target": {"simulation_roles": ["prospect"], "agent_ids": [], "persona_ids": [], "evidence_roles": []},
+                "private_instruction": "During your research you encounter Product X ... Decide whether you ignore, inspect, try or reject it.",
+                "condition": {"type": "not_mentioned", "terms": ["Product X"]},
+                "completion": {"type": "mentioned", "terms": ["Product X"]}
+            }]
+        }
+
+    Stage instructions are delivered privately into the targeted agents' memory at
+    the trigger round; they are never posted. The plan is resolved into every new
+    run's directory when the run is created (existing runs keep theirs).
+
+    Returns:
+        {"success": true, "data": {"stages": [...], "saved": true, "applies_to": "next_run"}}
+    """
+    from ..services.research_instructions import ExperimentPlanStore, validate_plan
+
+    try:
+        state = SimulationManager().get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": t("api.simulationNotFound", id=simulation_id)}), 404
+        selection = AgentSelectionStore.load(simulation_id) or {}
+        catalog = selection.get("role_catalog") or DEFAULT_ROLE_CATALOG
+        try:
+            plan = validate_plan(request.get_json() or {}, [r["id"] for r in catalog])
+        except ValueError as e:
+            return jsonify({"success": False, "error": str(e)}), 400
+        # Stages are run-scoped: the plan is resolved into each new run's directory
+        # at run creation; runs that already exist keep their own plan.
+        saved = ExperimentPlanStore.save(simulation_id, plan)
+        return jsonify({"success": True, "data": {**saved, "applies_to": "next_run"}})
+    except Exception as e:
+        logger.error(f"Failed to save experiment plan: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 
 # ============== Simulation management endpoints ==============
@@ -288,6 +552,22 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
             "stopped",
         ]
         profiles_generated = state_data.get("profiles_generated", config_generated)
+        # A saved agent selection must match the population the profiles were
+        # prepared for; simulations prepared before agent selection (no selection,
+        # no roster) stay startable as before.
+        selection = AgentSelectionStore.load(simulation_id)
+        roster = AgentSelectionStore.load_roster(simulation_id)
+        if selection is not None and not (
+            selection.get("confirmed") and roster
+            and roster.get("selection_hash") == selection.get("selection_hash")
+        ):
+            return False, {
+                "reason": "The agent selection changed since preparation (or is unconfirmed); prepare again",
+                "status": status,
+                "config_generated": config_generated,
+                "selection_out_of_sync": True,
+            }
+
         if status in prepared_statuses and config_generated and profiles_generated:
             # Get file statistics
             profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")
@@ -323,6 +603,8 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
             return True, {
                 "status": status,
                 "entities_count": state_data.get("entities_count", 0),
+                "active_agents_count": state_data.get("active_agents_count") or profiles_count,
+                "context_entities_count": state_data.get("context_entities_count", 0),
                 "profiles_count": profiles_count,
                 "entity_types": state_data.get("entity_types", []),
                 "config_generated": config_generated,
@@ -374,8 +656,14 @@ def prepare_simulation():
             "entity_types": ["Student", "PublicFigure"],  // optional, specified entity types
             "use_llm_for_profiles": true,                 // optional, whether to use LLM to generate personas
             "parallel_profile_count": 5,                  // optional, number of personas generated in parallel, default 5
-            "force_regenerate": false                     // optional, force regeneration, default false
+            "force_regenerate": false,                    // optional, force regeneration, default false
+            "agent_selection": {...}                      // optional, saved + confirmed before preparing
+                                                          // (same body as PUT /<id>/agent-selection)
         }
+
+    Only the entities marked active in the confirmed agent selection become OASIS
+    agents; without a confirmed selection the request fails with 400. A prepare
+    request while a preparation is running returns that task (no second task).
 
     Returns:
         {
@@ -414,6 +702,29 @@ def prepare_simulation():
                 }
             ), 404
 
+        # An explicit selection in the request is saved (and confirmed) first
+        if data.get("agent_selection") is not None:
+            try:
+                _save_selection(simulation_id, state, data["agent_selection"], confirmed_default=True)
+            except ValueError as e:
+                return jsonify({"success": False, "error": str(e)}), 400
+            except RuntimeError as e:
+                return jsonify({"success": False, "error": str(e)}), 409
+            state = manager.get_simulation(simulation_id)
+
+        # A running preparation is attached to, never duplicated (reload-safe)
+        if _prepare_task_running(state):
+            return jsonify({"success": True, "data": {
+                "simulation_id": simulation_id,
+                "task_id": state.prepare_task_id,
+                "status": "preparing",
+                "message": t("api.prepareStarted"),
+                "already_prepared": False,
+                "already_running": True,
+                "expected_entities_count": state.active_agents_count,
+                "graph_entities_count": state.entities_count,
+            }})
+
         # Check if force regenerate
         force_regenerate = data.get("force_regenerate", False)
         logger.info(
@@ -444,6 +755,16 @@ def prepare_simulation():
             else:
                 logger.info(f"Simulation {simulation_id} not prepared, will start preparation task")
 
+        # The population must be chosen explicitly: graph entity != agent
+        selection = AgentSelectionStore.load(simulation_id)
+        active_selected = sum(1 for e in (selection or {}).get("entities", []) if e.get("active"))
+        if not selection or not selection.get("confirmed") or active_selected == 0:
+            return jsonify({
+                "success": False,
+                "error": t("api.agentSelectionRequired"),
+                "agent_selection_required": True,
+            }), 400
+
         # Get required info from project
         project = ProjectManager.get_project(state.project_id)
         if not project:
@@ -461,8 +782,12 @@ def prepare_simulation():
                 {"success": False, "error": t("api.projectMissingRequirement")}
             ), 400
 
-        # Get document text
-        document_text = ProjectManager.get_extracted_text(state.project_id) or ""
+        # Context documents only: the assessment brief is research design, never
+        # simulation content (its instructions are delivered privately per run)
+        from ..services.research_instructions import load_project_brief
+
+        brief = load_project_brief(state.project_id)
+        document_text = brief["context_text"]
 
         entity_types_list = data.get("entity_types")
         use_llm_for_profiles = data.get("use_llm_for_profiles", True)
@@ -482,8 +807,11 @@ def prepare_simulation():
             # Save entity count to state (for frontend immediate access)
             state.entities_count = filtered_preview.filtered_count
             state.entity_types = list(filtered_preview.entity_types)
+            state.active_agents_count = active_selected
+            state.context_entities_count = max(filtered_preview.filtered_count - active_selected, 0)
             logger.info(
-                f"Expected entity count: {filtered_preview.filtered_count}, types: {filtered_preview.entity_types}"
+                f"Population: {active_selected} active agents / {filtered_preview.filtered_count} graph entities, "
+                f"types: {filtered_preview.entity_types}"
             )
         except Exception as e:
             logger.warning(f"Synchronously getting entity count failed (will retry in background task): {e}")
@@ -502,6 +830,7 @@ def prepare_simulation():
         state.profiles_generated = False
         state.config_generated = False
         state.error = None
+        state.prepare_task_id = task_id
         manager._save_simulation_state(state)
 
         # Capture locale before spawning background thread
@@ -595,6 +924,7 @@ def prepare_simulation():
                     use_llm_for_profiles=use_llm_for_profiles,
                     progress_callback=progress_callback,
                     parallel_profile_count=parallel_profile_count,
+                    brief=brief,
                 )
 
                 # Task complete
@@ -626,7 +956,9 @@ def prepare_simulation():
                     "status": "preparing",
                     "message": t("api.prepareStarted"),
                     "already_prepared": False,
-                    "expected_entities_count": state.entities_count,  # Expected Agent total
+                    "expected_entities_count": state.active_agents_count,  # Expected Agent total (active only)
+                    "graph_entities_count": state.entities_count,
+                    "context_entities_count": state.context_entities_count,
                     "entity_types": state.entity_types,  # Entity type list
                 },
             }
@@ -1138,7 +1470,7 @@ def get_simulation_profiles_realtime(simulation_id: str):
                     state_data = json.load(f)
                     status = state_data.get("status", "")
                     is_generating = status == "preparing"
-                    total_expected = state_data.get("entities_count")
+                    total_expected = state_data.get("active_agents_count") or state_data.get("entities_count")
                     error = state_data.get("error")
                     profiles_generated = state_data.get(
                         "profiles_generated", state_data.get("config_generated", False)

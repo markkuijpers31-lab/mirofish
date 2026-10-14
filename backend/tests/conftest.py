@@ -137,6 +137,33 @@ def make_prepared_simulation(simulation_id="sim_test", project_id="proj_test", s
     return sim_dir
 
 
+def select_entities(simulation_id, roles=None, active=None):
+    """
+    Save a confirmed agent selection (graph entities are never agents by default)
+
+    Args:
+        simulation_id: Simulation ID (its graph must exist)
+        roles: Optional {entity name: (simulation_role, evidence_role)}
+        active: Optional set of entity names to activate (default: every entity)
+    """
+    from app.services.agent_selection import AgentSelectionStore, apply_selection_update
+    from app.services.entity_reader import EntityReader
+
+    state = SimulationManager().get_simulation(simulation_id)
+    entities = EntityReader().filter_defined_entities(state.graph_id, enrich_with_edges=False).entities
+    updates = []
+    for e in entities:
+        item = {"entity_uuid": e.uuid, "active": active is None or e.name in active}
+        if roles and e.name in roles:
+            item["simulation_role"], item["evidence_role"] = roles[e.name]
+        updates.append(item)
+    document = apply_selection_update(
+        entities, {"entities": updates, "confirmed": True}, AgentSelectionStore.load(simulation_id), state.graph_id
+    )
+    AgentSelectionStore.save(simulation_id, document)
+    return document
+
+
 def default_actions(platform):
     """Actions a fake simulation run writes"""
     if platform == "twitter":

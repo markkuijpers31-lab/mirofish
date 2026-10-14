@@ -17,6 +17,45 @@ export const prepareSimulation = (data) => {
 }
 
 /**
+ * Get the agent selection: every eligible graph entity with active flag and roles
+ * (reading never changes anything)
+ * @param {string} simulationId
+ * @returns {Promise<Object>} { entities, role_catalog, evidence_roles, summary, confirmed, population }
+ */
+export const getAgentSelection = (simulationId) => {
+  return service.get(`/api/simulation/${simulationId}/agent-selection`)
+}
+
+/**
+ * Save the agent selection (a changed population invalidates the preparation)
+ * @param {string} simulationId
+ * @param {Object} data - { entities: [{ entity_uuid, active, simulation_role, evidence_role }], role_catalog?, confirmed }
+ * @returns {Promise<Object>} same as getAgentSelection + preparation_invalidated
+ */
+export const saveAgentSelection = (simulationId, data) => {
+  return service.put(`/api/simulation/${simulationId}/agent-selection`, data)
+}
+
+/**
+ * Get the private experiment plan (stages delivered privately to agents, never posted)
+ * @param {string} simulationId
+ * @returns {Promise<Object>} { stages, saved, condition_types, completion_types }
+ */
+export const getExperimentPlan = (simulationId) => {
+  return service.get(`/api/simulation/${simulationId}/experiment-plan`)
+}
+
+/**
+ * Save the private experiment plan (applies to the next run)
+ * @param {string} simulationId
+ * @param {Object} data - { stages: [...] }
+ * @returns {Promise<Object>}
+ */
+export const saveExperimentPlan = (simulationId, data) => {
+  return service.put(`/api/simulation/${simulationId}/experiment-plan`, data)
+}
+
+/**
  * Query preparation task progress
  * @param {Object} data - { task_id?, simulation_id? }
  */

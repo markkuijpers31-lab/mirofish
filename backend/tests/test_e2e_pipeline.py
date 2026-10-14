@@ -83,6 +83,20 @@ def test_full_pipeline_from_upload_to_audit_bundle(uploads, client, fake_popen, 
     # 3. Create + prepare the simulation (rule-based personas, default config without LLM)
     monkeypatch.setattr(SimulationConfigGenerator, "_call_llm_with_retry", lambda self, prompt, system_prompt: {})
     sim_id = client.post("/api/simulation/create", json={"project_id": project_id}).json["data"]["simulation_id"]
+
+    # Graph entities are not agents until selected: prepare is refused without a selection
+    refused = client.post("/api/simulation/prepare", json={"simulation_id": sim_id, "use_llm_for_profiles": False})
+    assert refused.status_code == 400 and refused.json["agent_selection_required"] is True
+    selection = client.get(f"/api/simulation/{sim_id}/agent-selection").json["data"]
+    assert selection["summary"]["active_agents"] == 0 and selection["summary"]["graph_entities"] == 3
+    roles = {"C01 Dutch first-time family": "prospect", "C02 German camper couple": "prospect",
+             "Camping De Linde": "brand_platform"}
+    saved = client.put(f"/api/simulation/{sim_id}/agent-selection", json={"confirmed": True, "entities": [
+        {"entity_uuid": e["entity_uuid"], "active": True, "simulation_role": roles[e["name"]]}
+        for e in selection["entities"]
+    ]}).json["data"]
+    assert saved["summary"]["active_agents"] == 3 and saved["confirmed"] is True
+
     prepare_task = client.post("/api/simulation/prepare", json={"simulation_id": sim_id, "use_llm_for_profiles": False}).json["data"]["task_id"]
     prepared = _wait(lambda: (lambda d: d if d["status"] in ("completed", "failed") else None)(
         client.post("/api/simulation/prepare/status", json={"task_id": prepare_task}).json["data"]))

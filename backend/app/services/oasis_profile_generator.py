@@ -948,6 +948,7 @@ Important:
         parallel_count: int = 5,
         realtime_output_path: Optional[str] = None,
         output_platform: str = "reddit",
+        private_texts: Optional[List[str]] = None,
     ) -> List[OasisAgentProfile]:
         """
         Batch generate Agent Profiles from entities (supports parallel generation)
@@ -960,10 +961,15 @@ Important:
             parallel_count: Parallel generation count, default 5
             realtime_output_path: Real-time write file path (if provided, writes once per generated profile)
             output_platform: Output platform format ("reddit" or "twitter")
+            private_texts: Private research instructions; any persona/bio sentence
+                reproducing one is removed (they are delivered privately at run time)
 
         Returns:
             Agent Profile list
         """
+        from .research_instructions import strip_private_text
+
+        private_texts = [p for p in (private_texts or []) if p]
         import concurrent.futures
         from threading import Lock
 
@@ -1026,6 +1032,11 @@ Important:
                 profile = self.generate_profile_from_entity(
                     entity=entity, user_id=idx, use_llm=use_llm
                 )
+                if private_texts:
+                    profile.bio = strip_private_text(profile.bio, private_texts) or profile.name
+                    profile.persona = strip_private_text(profile.persona, private_texts) or (
+                        f"{profile.name} is a participant in social discussions."
+                    )
 
                 # Output generated persona to console and log in real-time
                 self._print_generated_profile(entity.name, entity_type, profile)

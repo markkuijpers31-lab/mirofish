@@ -23,6 +23,7 @@ from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
 from ..utils.openai_chat_compat import create_chat_completion, extract_chat_completion_text
 from .entity_reader import EntityNode, EntityReader
+from .research_instructions import ORIGIN_SYSTEM_SEED, is_unsafe_public_text, strip_private_text
 
 logger = get_logger("mirofish.simulation_config")
 
@@ -81,6 +82,10 @@ class AgentActivityConfig:
     # Influence weight (determines probability of other Agents seeing their posts)
     influence_weight: float = 1.0
 
+    # Population roles chosen in the agent selection (configuration, not behaviour)
+    simulation_role: str = ""
+    evidence_role: str = ""
+
 
 @dataclass
 class TimeSimulationConfig:
@@ -130,6 +135,10 @@ class EventConfig:
 
     # Opinion guidance direction
     narrative_direction: str = ""
+
+    # Seed posts rejected because they contained research/orchestration content
+    # (kept for inspection, never published)
+    rejected_seed_posts: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -181,6 +190,13 @@ class SimulationParameters:
     generated_at: str = field(default_factory=lambda: datetime.now().isoformat())
     generation_reasoning: str = ""  # LLM reasoning explanation
 
+    # Population of this preparation (active agents vs. context-only entities)
+    population: Dict[str, Any] = field(default_factory=dict)
+
+    # Private research instruction texts known at prepare time. The runner uses
+    # them to classify leaked instructions; they are never published.
+    private_texts: List[str] = field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict"""
         time_dict = asdict(self.time_config)
@@ -200,6 +216,8 @@ class SimulationParameters:
             "llm_base_url": self.llm_base_url,
             "generated_at": self.generated_at,
             "generation_reasoning": self.generation_reasoning,
+            "population": self.population,
+            "private_texts": self.private_texts,
         }
 
     def to_json(self, indent: int = 2) -> str:
@@ -258,6 +276,10 @@ class SimulationConfigGenerator:
         enable_twitter: bool = True,
         enable_reddit: bool = True,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        context_entities: Optional[List[EntityNode]] = None,
+        roster: Optional[Dict[str, Any]] = None,
+        private_texts: Optional[List[str]] = None,
+        brief_text: str = "",
     ) -> SimulationParameters:
         """
         Intelligently generate the complete simulation configuration (step-by-step generation)
@@ -268,10 +290,14 @@ class SimulationConfigGenerator:
             graph_id: Graph ID
             simulation_requirement: Simulation requirement description
             document_text: Original document content
-            entities: Filtered entity list
+            entities: Active agent entities (only these become simulation accounts)
             enable_twitter: Whether to enable Twitter
             enable_reddit: Whether to enable Reddit
             progress_callback: Progress callback function(current_step, total_steps, message)
+            context_entities: Context-only graph entities (may be mentioned, never accounts)
+            roster: Frozen agent roster (roles per active agent)
+            private_texts: Private research instructions (never allowed in seed posts)
+            brief_text: Assessment brief (verbatim copies are rejected as seed posts)
 
         Returns:
             SimulationParameters: Complete simulation parameters
@@ -292,11 +318,20 @@ class SimulationConfigGenerator:
                 progress_callback(step, total_steps, message)
             logger.info(f"[{step}/{total_steps}] {message}")
 
+        private_texts = list(private_texts or [])
+        self._private_texts = private_texts
+        # The requirement may embed research instructions; the LLM never sees them
+        simulation_requirement = strip_private_text(simulation_requirement, private_texts) or simulation_requirement
+        roles_by_uuid = {
+            a["entity_uuid"]: a for a in (roster or {}).get("active_agents", [])
+        }
+
         # 1. Build base context info
         context = self._build_context(
             simulation_requirement=simulation_requirement,
             document_text=document_text,
             entities=entities,
+            context_entities=context_entities,
         )
 
         reasoning_parts = []
@@ -344,6 +379,20 @@ class SimulationConfigGenerator:
                 simulation_requirement=simulation_requirement,
             )
             all_agent_configs.extend(batch_configs)
+
+        for cfg in all_agent_configs:
+            role = roles_by_uuid.get(cfg.entity_uuid)
+            if role:
+                if int(role.get("agent_id", cfg.agent_id)) != cfg.agent_id:
+                    raise ValueError(
+                        f"Agent id mismatch for {cfg.entity_name}: roster {role.get('agent_id')} vs config {cfg.agent_id}"
+                    )
+                cfg.simulation_role = role.get("simulation_role", "")
+                cfg.evidence_role = role.get("evidence_role", "")
+
+        # Seed posts are in-world content only: drop anything that carries research
+        # instructions, persona tasks or verbatim brief text
+        event_config = self._filter_seed_posts(event_config, private_texts, brief_text)
 
         reasoning_parts.append(
             t("progress.agentConfigResult", count=len(all_agent_configs))
@@ -400,6 +449,12 @@ class SimulationConfigGenerator:
             llm_model=self.model_name,
             llm_base_url=self.base_url,
             generation_reasoning=" | ".join(reasoning_parts),
+            population={
+                "active_agents": len(all_agent_configs),
+                "context_entities": len(context_entities or []),
+                "selection_hash": (roster or {}).get("selection_hash"),
+            },
+            private_texts=private_texts,
         )
 
         logger.info(f"Simulation config generation complete: {len(params.agent_configs)}  Agent configs")
@@ -411,6 +466,7 @@ class SimulationConfigGenerator:
         simulation_requirement: str,
         document_text: str,
         entities: List[EntityNode],
+        context_entities: Optional[List[EntityNode]] = None,
     ) -> str:
         """Build the LLM context, truncate to max length"""
 
@@ -420,8 +476,17 @@ class SimulationConfigGenerator:
         # Build context
         context_parts = [
             f"## Simulation requirement\n{simulation_requirement}",
-            f"\n## Entity info ({len(entities)} entities)\n{entity_summary}",
+            f"\n## Active simulation accounts ({len(entities)} agents)\n{entity_summary}",
         ]
+        if context_entities:
+            names = ", ".join(
+                f"{e.name} ({e.get_entity_type() or 'Entity'})" for e in context_entities[:60]
+            )
+            more = f" ... {len(context_entities) - 60} more" if len(context_entities) > 60 else ""
+            context_parts.append(
+                f"\n## Context-only entities ({len(context_entities)}; part of the world, may be "
+                f"mentioned, but they are NOT simulation accounts and never post)\n{names}{more}"
+            )
 
         current_length = sum(len(p) for p in context_parts)
         remaining_length = (
@@ -435,6 +500,10 @@ class SimulationConfigGenerator:
             context_parts.append(f"\n## Original document content\n{doc_text}")
 
         return "\n".join(context_parts)
+
+    def _public_summary(self, entity: EntityNode) -> str:
+        """Entity summary without private research instruction text"""
+        return strip_private_text(entity.summary or "", getattr(self, "_private_texts", []))
 
     def _summarize_entities(self, entities: List[EntityNode]) -> str:
         """Generate an entity summary"""
@@ -454,10 +523,11 @@ class SimulationConfigGenerator:
             display_count = self.ENTITIES_PER_TYPE_DISPLAY
             summary_len = self.ENTITY_SUMMARY_LENGTH
             for e in type_entities[:display_count]:
+                summary = self._public_summary(e)
                 summary_preview = (
-                    (e.summary[:summary_len] + "...")
-                    if len(e.summary) > summary_len
-                    else e.summary
+                    (summary[:summary_len] + "...")
+                    if len(summary) > summary_len
+                    else summary
                 )
                 lines.append(f"- {e.name}: {summary_preview}")
             if len(type_entities) > display_count:
@@ -737,6 +807,11 @@ Please generate the event configuration JSON:
 **Important**: poster_type must be chosen from the "Available Entity Types" above, so that initial posts can be assigned to the appropriate agent for publishing.
 For example: official statements should be posted by Official/University types, news by MediaOutlet, student opinions by Student.
 
+**Initial posts are in-world seed content only.** They are public social-media posts that exist in the simulated world.
+They must NEVER contain research or experiment material: no prompts, instructions, test tasks, stage descriptions,
+funnel requirements, hypotheses, persona identifiers (such as "C03"), or text copied from the research brief.
+Private research instructions are delivered to agents through a separate private channel, not through posts.
+
 Return JSON format (no markdown):
 {{
     "hot_topics": ["keyword1", "keyword2", ...],
@@ -771,16 +846,48 @@ Return JSON format (no markdown):
             narrative_direction=result.get("narrative_direction", ""),
         )
 
+    def _filter_seed_posts(
+        self, event_config: EventConfig, private_texts: List[str], brief_text: str
+    ) -> EventConfig:
+        """
+        Remove seed posts that carry research/orchestration content
+
+        Rejected posts are kept in event_config.rejected_seed_posts for inspection
+        and are never published.
+        """
+        kept = []
+        for post in event_config.initial_posts or []:
+            if not isinstance(post, dict):
+                continue
+            content = str(post.get("content") or "").strip()
+            if not content:
+                continue
+            unsafe, reason = is_unsafe_public_text(content, private_texts, brief_text)
+            if unsafe:
+                logger.warning(f"Seed post rejected ({reason}): {content[:80]!r}")
+                event_config.rejected_seed_posts.append({"content": content, "reason": reason,
+                                                         "poster_type": post.get("poster_type")})
+                continue
+            kept.append(post)
+        event_config.initial_posts = kept
+        return event_config
+
     def _assign_initial_post_agents(
         self, event_config: EventConfig, agent_configs: List[AgentActivityConfig]
     ) -> EventConfig:
         """
         Assign suitable publisher Agents to initial posts
 
-        Matches the most appropriate agent_id based on each post's poster_type
+        Matches the most appropriate agent_id based on each post's poster_type.
+        Seed content is preferably published by agents that are not target
+        consumers, so target-consumer accounts do not carry system content.
         """
         if not event_config.initial_posts:
             return event_config
+
+        non_target = [a for a in agent_configs if a.evidence_role and a.evidence_role != "target_consumer"]
+        if non_target:
+            agent_configs = non_target
 
         # Build agent index by entity type
         agents_by_type: Dict[str, List[AgentActivityConfig]] = {}
@@ -852,6 +959,7 @@ Return JSON format (no markdown):
                     "content": content,
                     "poster_type": post.get("poster_type", "Unknown"),
                     "poster_agent_id": matched_agent_id,
+                    "origin": ORIGIN_SYSTEM_SEED,
                 }
             )
 
@@ -880,7 +988,7 @@ Return JSON format (no markdown):
                     "agent_id": start_idx + i,
                     "entity_name": e.name,
                     "entity_type": e.get_entity_type() or "Unknown",
-                    "summary": e.summary[:summary_len] if e.summary else "",
+                    "summary": self._public_summary(e)[:summary_len],
                 }
             )
 

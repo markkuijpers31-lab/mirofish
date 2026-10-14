@@ -179,6 +179,30 @@ Grotesk', 'Noto Sans SC', monospace`. Palette: black/white + orange
   so every line carries `[sim][run][area]`.
 - Step 3 must never start a run on mount; see `frontend/src/utils/runLifecycle.js`.
 
+## Agent Selection, Private Instructions and Action Origin
+
+- **Graph entity != agent.** `services/agent_selection.py`: the user confirms which
+  eligible graph entities are active (`agent_selection.json`, per entity: active,
+  `simulation_role` from an editable role catalog, `evidence_role` ∈
+  `target_consumer | influencer_context | excluded`). `/prepare` refuses without a
+  confirmed selection; prepare freezes it into `agent_roster.json` (active agents get
+  ids 0..N-1). Inactive entities stay in the graph as context and never get profiles.
+  Changing the population invalidates the preparation; existing runs keep their snapshot.
+- Duplicates: `services/entity_canonicalizer.py` groups high-confidence variants
+  (case/domain/persona id) as aliases and only flags ambiguous short forms. Never merge graph nodes.
+- The assessment brief is research design, not simulation content
+  (`services/research_instructions.py`): config/persona LLM context excludes brief
+  documents and private instruction text; seed posts that look like instructions are
+  rejected (`event_config.rejected_seed_posts`).
+- Private instructions/stages: `experiment_plan.json` (default: derived from the brief)
+  is resolved per run into `runs/<run_id>/experiment_plan.json`. The runner
+  (`scripts/run_orchestration.py`) delivers stage instructions into agent memory only,
+  never as posts. Trigger round >= 1; round 0 is seed content only.
+- Every logged action has `origin`: `agent_generated | system_seed |
+  researcher_instruction` (events use `orchestration`). Only `agent_generated` is
+  behavioural evidence; conversion metrics default to
+  `evidence_role = target_consumer AND origin = agent_generated` (`RunEvidence.consumer_metrics`).
+
 ## Ports / Proxy
 
 Backend `5001`, frontend dev `3000`. Vite proxies `/api` → `http://localhost:5001`

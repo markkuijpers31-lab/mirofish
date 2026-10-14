@@ -39,6 +39,8 @@ sys.path.insert(0, _backend_dir)
 # Load the .env file from the project root (contains LLM_API_KEY and other settings)
 from dotenv import load_dotenv
 
+from run_orchestration import RunOrchestrator
+
 _env_file = os.path.join(_project_root, ".env")
 if os.path.exists(_env_file):
     load_dotenv(_env_file)
@@ -617,9 +619,10 @@ class TwitterSimulationRunner:
         self.ipc_handler = IPCHandler(self.simulation_dir, self.env, self.agent_graph)
         self.ipc_handler.update_status("running")
 
-        # Execute initial events
-        event_config = self.config.get("event_config", {})
-        initial_posts = event_config.get("initial_posts", [])
+        # Seed posts are in-world content only; research instructions are
+        # delivered privately per stage (see run_orchestration.py)
+        orchestrator = RunOrchestrator(self.config, self.simulation_dir)
+        initial_posts = orchestrator.seed_posts()
 
         if initial_posts:
             print(f"Executing initial events ({len(initial_posts)} initial posts)...")
@@ -656,6 +659,14 @@ class TwitterSimulationRunner:
             active_agents = self._get_active_agents_for_round(
                 self.env, simulated_hour, round_num
             )
+
+            # Private stage instructions due this round go into agent memory only
+            for agent_id in orchestrator.deliver_due(round_num + 1, self.env.agent_graph.get_agent):
+                if all(aid != agent_id for aid, _ in active_agents):
+                    try:
+                        active_agents.append((agent_id, self.env.agent_graph.get_agent(agent_id)))
+                    except Exception:
+                        pass
 
             if not active_agents:
                 continue
