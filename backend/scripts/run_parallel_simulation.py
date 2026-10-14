@@ -171,6 +171,7 @@ def init_logging_for_simulation(simulation_dir: str):
 
 
 from action_logger import SimulationLogManager, PlatformActionLogger
+from run_orchestration import ORIGIN_SYSTEM_SEED, RunOrchestrator, max_trace_rowid
 
 try:
     from camel.models import ModelFactory
@@ -1240,9 +1241,12 @@ async def run_twitter_simulation(
     total_actions = 0
     last_rowid = 0  # Track the last processed row in the database (use rowid to avoid created_at format differences)
 
-    # Execute initial events
-    event_config = config.get("event_config", {})
-    initial_posts = event_config.get("initial_posts", [])
+    # Private experiment stages, origins and seed content (see run_orchestration.py)
+    orchestrator = RunOrchestrator(config, simulation_dir, action_logger)
+
+    # Execute initial events: in-world seed posts only (origin system_seed).
+    # Research instructions never become posts; they are delivered privately.
+    initial_posts = orchestrator.seed_posts()
 
     # Record round 0 start (initial event phase)
     if action_logger:
@@ -1251,14 +1255,21 @@ async def run_twitter_simulation(
     initial_action_count = 0
     if initial_posts:
         initial_actions = {}
+        seed_logged = []
         for post in initial_posts:
             agent_id = post.get("poster_agent_id", 0)
             content = post.get("content", "")
             try:
                 agent = result.env.agent_graph.get_agent(agent_id)
-                initial_actions[agent] = ManualAction(
+                action = ManualAction(
                     action_type=ActionType.CREATE_POST, action_args={"content": content}
                 )
+                if agent in initial_actions:
+                    if not isinstance(initial_actions[agent], list):
+                        initial_actions[agent] = [initial_actions[agent]]
+                    initial_actions[agent].append(action)
+                else:
+                    initial_actions[agent] = action
 
                 if action_logger:
                     action_logger.log_action(
@@ -1267,15 +1278,23 @@ async def run_twitter_simulation(
                         agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
                         action_type="CREATE_POST",
                         action_args={"content": content},
+                        origin=ORIGIN_SYSTEM_SEED,
                     )
                     total_actions += 1
                     initial_action_count += 1
+                seed_logged.append({"agent_id": agent_id, "action_type": "CREATE_POST",
+                                    "action_args": {"content": content}, "origin": ORIGIN_SYSTEM_SEED})
             except Exception:
                 pass
 
         if initial_actions:
             await result.env.step(initial_actions)
-            log_info(f"Published {len(initial_actions)} initial posts")
+            log_info(f"Published {len(initial_posts)} seed posts")
+        orchestrator.observe(0, seed_logged)
+
+    # The seed step wrote its posts into the trace table: skip them so they are
+    # never logged a second time as round-1 agent actions
+    last_rowid = max_trace_rowid(db_path)
 
     # Record round 0 end
     if action_logger:
@@ -1319,6 +1338,15 @@ async def run_twitter_simulation(
         if action_logger:
             action_logger.log_round_start(round_num + 1, simulated_hour)
 
+        # Private stage instructions due this round go into agent memory (never
+        # onto the platform); recipients get a turn, what they do stays their choice
+        for agent_id in orchestrator.deliver_due(round_num + 1, result.env.agent_graph.get_agent):
+            if all(aid != agent_id for aid, _ in active_agents):
+                try:
+                    active_agents.append((agent_id, result.env.agent_graph.get_agent(agent_id)))
+                except Exception:
+                    pass
+
         if not active_agents:
             # Also record round end when there are no active agents (actions_count=0)
             if action_logger:
@@ -1335,6 +1363,8 @@ async def run_twitter_simulation(
 
         round_action_count = 0
         for action_data in actual_actions:
+            origin, origin_flag = orchestrator.classify(action_data)
+            action_data["origin"] = origin
             if action_logger:
                 action_logger.log_action(
                     round_num=round_num + 1,
@@ -1342,9 +1372,12 @@ async def run_twitter_simulation(
                     agent_name=action_data["agent_name"],
                     action_type=action_data["action_type"],
                     action_args=action_data["action_args"],
+                    origin=origin,
+                    origin_flag=origin_flag,
                 )
                 total_actions += 1
                 round_action_count += 1
+        orchestrator.observe(round_num + 1, actual_actions)
 
         if action_logger:
             action_logger.log_round_end(round_num + 1, round_action_count)
@@ -1438,9 +1471,12 @@ async def run_reddit_simulation(
     total_actions = 0
     last_rowid = 0  # Track the last processed row in the database (use rowid to avoid created_at format differences)
 
-    # Execute initial events
-    event_config = config.get("event_config", {})
-    initial_posts = event_config.get("initial_posts", [])
+    # Private experiment stages, origins and seed content (see run_orchestration.py)
+    orchestrator = RunOrchestrator(config, simulation_dir, action_logger)
+
+    # Execute initial events: in-world seed posts only (origin system_seed).
+    # Research instructions never become posts; they are delivered privately.
+    initial_posts = orchestrator.seed_posts()
 
     # Record round 0 start (initial event phase)
     if action_logger:
@@ -1449,25 +1485,21 @@ async def run_reddit_simulation(
     initial_action_count = 0
     if initial_posts:
         initial_actions = {}
+        seed_logged = []
         for post in initial_posts:
             agent_id = post.get("poster_agent_id", 0)
             content = post.get("content", "")
             try:
                 agent = result.env.agent_graph.get_agent(agent_id)
+                action = ManualAction(
+                    action_type=ActionType.CREATE_POST, action_args={"content": content}
+                )
                 if agent in initial_actions:
                     if not isinstance(initial_actions[agent], list):
                         initial_actions[agent] = [initial_actions[agent]]
-                    initial_actions[agent].append(
-                        ManualAction(
-                            action_type=ActionType.CREATE_POST,
-                            action_args={"content": content},
-                        )
-                    )
+                    initial_actions[agent].append(action)
                 else:
-                    initial_actions[agent] = ManualAction(
-                        action_type=ActionType.CREATE_POST,
-                        action_args={"content": content},
-                    )
+                    initial_actions[agent] = action
 
                 if action_logger:
                     action_logger.log_action(
@@ -1476,15 +1508,23 @@ async def run_reddit_simulation(
                         agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
                         action_type="CREATE_POST",
                         action_args={"content": content},
+                        origin=ORIGIN_SYSTEM_SEED,
                     )
                     total_actions += 1
                     initial_action_count += 1
+                seed_logged.append({"agent_id": agent_id, "action_type": "CREATE_POST",
+                                    "action_args": {"content": content}, "origin": ORIGIN_SYSTEM_SEED})
             except Exception:
                 pass
 
         if initial_actions:
             await result.env.step(initial_actions)
-            log_info(f"Published {len(initial_actions)} initial posts")
+            log_info(f"Published {len(initial_posts)} seed posts")
+        orchestrator.observe(0, seed_logged)
+
+    # The seed step wrote its posts into the trace table: skip them so they are
+    # never logged a second time as round-1 agent actions
+    last_rowid = max_trace_rowid(db_path)
 
     # Record round 0 end
     if action_logger:
@@ -1528,6 +1568,15 @@ async def run_reddit_simulation(
         if action_logger:
             action_logger.log_round_start(round_num + 1, simulated_hour)
 
+        # Private stage instructions due this round go into agent memory (never
+        # onto the platform); recipients get a turn, what they do stays their choice
+        for agent_id in orchestrator.deliver_due(round_num + 1, result.env.agent_graph.get_agent):
+            if all(aid != agent_id for aid, _ in active_agents):
+                try:
+                    active_agents.append((agent_id, result.env.agent_graph.get_agent(agent_id)))
+                except Exception:
+                    pass
+
         if not active_agents:
             # Also record round end when there are no active agents (actions_count=0)
             if action_logger:
@@ -1544,6 +1593,8 @@ async def run_reddit_simulation(
 
         round_action_count = 0
         for action_data in actual_actions:
+            origin, origin_flag = orchestrator.classify(action_data)
+            action_data["origin"] = origin
             if action_logger:
                 action_logger.log_action(
                     round_num=round_num + 1,
@@ -1551,9 +1602,12 @@ async def run_reddit_simulation(
                     agent_name=action_data["agent_name"],
                     action_type=action_data["action_type"],
                     action_args=action_data["action_args"],
+                    origin=origin,
+                    origin_flag=origin_flag,
                 )
                 total_actions += 1
                 round_action_count += 1
+        orchestrator.observe(round_num + 1, actual_actions)
 
         if action_logger:
             action_logger.log_round_end(round_num + 1, round_action_count)

@@ -19,8 +19,19 @@ RUNS_DIRNAME = "runs"
 RUN_RECORD_FILE = "run.json"
 LEGACY_RUN_ID = "legacy"
 
-# Files copied from the simulation (configuration) directory into every run
-SNAPSHOT_FILES = ("simulation_config.json", "reddit_profiles.json", "twitter_profiles.csv")
+# Files copied from the simulation (configuration) directory into every run.
+# agent_roster.json is the population frozen at prepare (active agents with their
+# simulation/evidence roles plus context-only entities); agent_selection.json and
+# experiment_plan.json are the user's configuration at the time the run started.
+SNAPSHOT_FILES = (
+    "simulation_config.json",
+    "reddit_profiles.json",
+    "twitter_profiles.csv",
+    "agent_roster.json",
+    "agent_selection.json",
+    "experiment_plan.json",
+    "source_requirements.json",
+)
 
 
 class RunStatus(str, Enum):
@@ -438,6 +449,20 @@ class RunStore:
                 pass
 
         snapshot: Dict[str, Any] = {"files": copied}
+        roster_path = os.path.join(run_dir, "agent_roster.json")
+        if os.path.exists(roster_path):
+            try:
+                with open(roster_path, "r", encoding="utf-8") as f:
+                    roster = json.load(f)
+                snapshot["population"] = {
+                    "selection_hash": roster.get("selection_hash"),
+                    "active_agents": len(roster.get("active_agents", [])),
+                    "context_entities": len(roster.get("context_entities", [])),
+                }
+            except Exception as e:
+                log.warning(f"Unreadable agent roster: {e}")
+        else:
+            snapshot["population"] = {"legacy": True, "note": "prepared before explicit agent selection; every prepared agent is active"}
         try:
             from .run_evidence import snapshot_run_inputs
 
@@ -447,6 +472,28 @@ class RunStore:
             # the report will fall back to the project files and flag it.
             log.warning(f"Input snapshot incomplete: {e}")
             snapshot["snapshot_error"] = str(e)
+
+        try:
+            from .research_instructions import snapshot_run_plan
+            from .source_requirements import REQUIREMENTS_FILE, COVERAGE_FILE, check_coverage
+            from .research_instructions import _run_source_documents
+
+            snapshot["experiment_plan"] = snapshot_run_plan(run_dir, simulation_id)
+            requirements_path = os.path.join(run_dir, REQUIREMENTS_FILE)
+            if os.path.exists(requirements_path):
+                with open(requirements_path, "r", encoding="utf-8") as f:
+                    coverage = check_coverage(json.load(f), _run_source_documents(run_dir))
+                with open(os.path.join(run_dir, COVERAGE_FILE), "w", encoding="utf-8") as f:
+                    json.dump(coverage, f, ensure_ascii=False, indent=2)
+                snapshot["source_coverage_ok"] = coverage["ok"]
+                if not coverage["ok"]:
+                    raise ValueError(f"required source sections missing: {coverage['missing']}")
+        except Exception as e:
+            # A run never starts with an unresolved plan or incomplete required
+            # sources: it would silently drop private stages or authority.
+            log.warning(f"Run refused, experiment not resolvable: {e}")
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise ValueError(f"Experiment configuration invalid for a new run: {e}")
 
         record = RunRecord(
             run_id=run_id,

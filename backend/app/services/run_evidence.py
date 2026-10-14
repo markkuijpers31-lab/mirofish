@@ -12,9 +12,19 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..utils.logger import get_run_logger
 from ..utils.persona_ids import PersonaIndex, build_persona_index, parse_identifier
 from .assessment_spec import BRIEF_FILENAME_RE, compose_brief, extract_spec_regex
+from .agent_selection import EVIDENCE_TARGET_CONSUMER, ROSTER_FILE
+from .research_instructions import (
+    ORIGIN_AGENT_GENERATED, ORIGIN_ORCHESTRATION, ORIGIN_RESEARCHER_INSTRUCTION, ORIGIN_SYSTEM_SEED, ORIGINS,
+)
 from .run_store import LEGACY_RUN_ID, RunRecord, RunStore
 
 PLATFORMS = ("twitter", "reddit")
+
+# Default scope of conversion / adoption metrics
+CONSUMER_METRIC_SCOPE = f"evidence_role = {EVIDENCE_TARGET_CONSUMER} AND origin = {ORIGIN_AGENT_GENERATED}"
+
+# Events written by the runner for inspection (never counted as actions)
+ORCHESTRATION_EVENT_TYPES = ("private_instruction", "stage_completed", "seed_post_rejected")
 PLATFORM_REF_PREFIX = {"twitter": "TW", "reddit": "RD"}
 
 # action_args keys holding text the actor wrote themselves
@@ -65,9 +75,14 @@ def load_agents(run_dir: str) -> List[Dict[str, Any]]:
             "agent_id": agent_id,
             "name": ac.get("entity_name") or "",
             "entity_type": ac.get("entity_type"),
+            "entity_uuid": ac.get("entity_uuid"),
             "stance": ac.get("stance"),
             "activity_level": ac.get("activity_level"),
         }
+        if ac.get("simulation_role"):
+            agents[agent_id]["simulation_role"] = ac["simulation_role"]
+        if ac.get("evidence_role"):
+            agents[agent_id]["evidence_role"] = ac["evidence_role"]
 
     reddit_profiles = _read_json(os.path.join(run_dir, "reddit_profiles.json"), []) or []
     for p in reddit_profiles:
@@ -100,6 +115,20 @@ def load_agents(run_dir: str) -> List[Dict[str, Any]]:
                         agent["persona"] = row.get("user_char")
         except Exception:
             pass
+
+    # The frozen roster (agent selection) is the authority on roles
+    roster = _read_json(os.path.join(run_dir, ROSTER_FILE), None)
+    for entry in (roster or {}).get("active_agents", []) or []:
+        try:
+            agent_id = int(entry.get("agent_id"))
+        except (TypeError, ValueError):
+            continue
+        agent = agents.setdefault(agent_id, {"agent_id": agent_id, "name": entry.get("name") or ""})
+        for key in ("simulation_role", "evidence_role", "entity_uuid"):
+            if entry.get(key):
+                agent[key] = entry[key]
+        agent["simulation_role_label"] = entry.get("simulation_role_label")
+        agent["evidence_role_label"] = entry.get("evidence_role_label")
 
     return [agents[k] for k in sorted(agents)]
 
@@ -216,6 +245,14 @@ class RunEvidence:
         self.brief_text = ""
         self.brief_documents: List[str] = []
         self.used_sources: set = set()
+        self.roster: Optional[Dict[str, Any]] = None
+        self.roles_source = "legacy_default"
+        self.roles_note = ""
+        self.agent_roles: Dict[int, Dict[str, Any]] = {}
+        self.orchestration_events: List[Dict[str, Any]] = []
+        self.source_requirements: Optional[Dict[str, Any]] = None
+        self.plan_record_labels: List[str] = []
+        self.derived_fields: Dict[str, Dict[str, Any]] = {}
 
     # ---------- loading ----------
 
@@ -240,7 +277,12 @@ class RunEvidence:
     def _load_all(self):
         self.config = _read_json(os.path.join(self.run_dir, "simulation_config.json"), {}) or {}
         self._load_sources_and_brief()
+        self.source_requirements = _read_json(os.path.join(self.run_dir, "source_requirements.json"), None)
+        plan = _read_json(os.path.join(self.run_dir, "experiment_plan.json"), {}) or {}
+        self.plan_record_labels = sorted({r for st in plan.get("stages", []) for r in st.get("records") or []})
+        self.derived_fields: Dict[str, Dict[str, Any]] = plan.get("derived_fields") or {}
         self.agents = load_agents(self.run_dir)
+        self._load_roles()
         personas_file = _read_json(os.path.join(self.run_dir, "personas.json"), {}) or {}
         self.set_requested_ids(personas_file.get("requested_ids") or [])
         self._load_actions()
@@ -304,6 +346,45 @@ class RunEvidence:
                 project.additional_context if project else None,
                 self.sources,
             )
+
+    def _load_roles(self):
+        """Simulation / evidence role per agent (roster > config > legacy default)"""
+        self.roster = _read_json(os.path.join(self.run_dir, ROSTER_FILE), None)
+        if self.roster:
+            self.roles_source = "roster"
+        elif any(a.get("evidence_role") for a in self.agents):
+            self.roles_source = "config"
+        else:
+            self.roles_source = "legacy_default"
+            self.roles_note = (
+                "This run was prepared before explicit agent selection: no simulation/evidence roles are "
+                "recorded, so every agent is treated as a target consumer."
+            )
+        for a in self.agents:
+            self.agent_roles[int(a["agent_id"])] = {
+                "simulation_role": a.get("simulation_role") or ("unassigned" if self.roles_source != "legacy_default" else "legacy"),
+                "evidence_role": a.get("evidence_role") or EVIDENCE_TARGET_CONSUMER,
+            }
+
+    def roles_for_agent(self, agent_id: Any) -> Dict[str, Any]:
+        try:
+            agent_id = int(agent_id)
+        except (TypeError, ValueError):
+            pass
+        return self.agent_roles.get(agent_id) or {"simulation_role": "unknown", "evidence_role": "unknown"}
+
+    def persona_evidence_role(self, canonical_id: str) -> str:
+        """Evidence role of a persona (target consumer if any of its agents is one)"""
+        persona = self.persona_index.personas.get(canonical_id)
+        roles = [self.roles_for_agent(aid)["evidence_role"] for aid in (persona or {}).get("agent_ids", [])]
+        if EVIDENCE_TARGET_CONSUMER in roles:
+            return EVIDENCE_TARGET_CONSUMER
+        return roles[0] if roles else "unknown"
+
+    def persona_simulation_role(self, canonical_id: str) -> str:
+        persona = self.persona_index.personas.get(canonical_id)
+        roles = [self.roles_for_agent(aid)["simulation_role"] for aid in (persona or {}).get("agent_ids", [])]
+        return roles[0] if roles else "unknown"
 
     def _project_id_from_state(self) -> Optional[str]:
         state = _read_json(os.path.join(RunStore.sim_dir(self.simulation_id), "state.json"), {}) or {}
@@ -383,6 +464,18 @@ class RunEvidence:
                 self.integrity["warnings"].append(f"{info['file']} has {malformed} malformed lines (skipped).")
             self.integrity["platforms"][label] = info
 
+            for event in segments[-1]["events"]:
+                if event.get("event_type") in ORCHESTRATION_EVENT_TYPES:
+                    self.orchestration_events.append({**event, "platform": platform or event.get("platform")})
+
+            # Older logs carry no origin: round-0 posts were system seed posts, and the
+            # runner re-logged them at round 1 (trace re-read) - both are seed content.
+            seeds = {
+                (d.get("agent_id"), (d.get("action_args") or {}).get("content"))
+                for d in segments[-1]["actions"]
+                if d.get("round", 0) == 0 and d.get("action_type") == "CREATE_POST"
+            }
+            seed_repeats_left = set(seeds)
             for data in segments[-1]["actions"]:
                 plat = platform or data.get("platform") or "unknown"
                 counters[plat] = counters.get(plat, 0) + 1
@@ -390,6 +483,16 @@ class RunEvidence:
                 args = data.get("action_args") or {}
                 authored, target = _describe_action(args)
                 canonical, display = self.persona_index.resolve(data.get("agent_id"), data.get("agent_name"))
+                origin, origin_flag = data.get("origin"), data.get("origin_flag")
+                if origin not in ORIGINS:
+                    origin, origin_flag = ORIGIN_AGENT_GENERATED, None
+                    key = (data.get("agent_id"), args.get("content"))
+                    if data.get("round", 0) == 0 and data.get("action_type") == "CREATE_POST":
+                        origin, origin_flag = ORIGIN_SYSTEM_SEED, "legacy_round0_seed"
+                    elif data.get("action_type") == "CREATE_POST" and key in seed_repeats_left:
+                        seed_repeats_left.discard(key)
+                        origin, origin_flag = ORIGIN_SYSTEM_SEED, "legacy_duplicate_seed"
+                roles = self.roles_for_agent(data.get("agent_id"))
                 self.actions.append({
                     "ref": ref,
                     "platform": plat,
@@ -404,11 +507,141 @@ class RunEvidence:
                     "target": target,
                     "success": data.get("success", True),
                     "args": args,
+                    "origin": origin,
+                    "origin_flag": origin_flag,
+                    "simulation_role": roles["simulation_role"],
+                    "evidence_role": roles["evidence_role"],
                 })
             if platform:
                 self.events[platform] = segments[-1]["events"]
 
     # ---------- queries ----------
+
+    @staticmethod
+    def is_behavioural(a: Dict[str, Any]) -> bool:
+        """Only actions the agent itself generated are behavioural evidence"""
+        return a.get("origin", ORIGIN_AGENT_GENERATED) == ORIGIN_AGENT_GENERATED
+
+    @classmethod
+    def is_consumer_evidence(cls, a: Dict[str, Any]) -> bool:
+        """Counts in conversion / adoption metrics (CONSUMER_METRIC_SCOPE)"""
+        return cls.is_behavioural(a) and a.get("evidence_role") == EVIDENCE_TARGET_CONSUMER
+
+    def behavioural_actions(self) -> List[Dict[str, Any]]:
+        return [a for a in self.actions if self.is_behavioural(a)]
+
+    def consumer_actions(self) -> List[Dict[str, Any]]:
+        return [a for a in self.actions if self.is_consumer_evidence(a)]
+
+    def consumer_metrics(self) -> Dict[str, Any]:
+        """
+        Conversion / adoption counts, restricted to target consumers' own actions
+
+        Seed content, researcher instructions and the actions of existing users,
+        advocates or platform accounts are reported as excluded, never counted.
+        """
+        consumer = self.consumer_actions()
+        by_type: Dict[str, int] = {}
+        by_persona: Dict[str, int] = {}
+        for a in consumer:
+            by_type[a["action_type"]] = by_type.get(a["action_type"], 0) + 1
+            by_persona[a["canonical_id"]] = by_persona.get(a["canonical_id"], 0) + 1
+        target_personas = sorted(
+            cid for cid in self.persona_index.personas if self.persona_evidence_role(cid) == EVIDENCE_TARGET_CONSUMER
+        )
+        excluded_origin: Dict[str, int] = {}
+        excluded_role: Dict[str, int] = {}
+        for a in self.actions:
+            if not self.is_behavioural(a):
+                excluded_origin[a["origin"]] = excluded_origin.get(a["origin"], 0) + 1
+            elif a.get("evidence_role") != EVIDENCE_TARGET_CONSUMER:
+                excluded_role[a.get("evidence_role") or "unknown"] = excluded_role.get(a.get("evidence_role") or "unknown", 0) + 1
+        return {
+            "scope": CONSUMER_METRIC_SCOPE,
+            "roles_source": self.roles_source,
+            "actions": len(consumer),
+            "by_action_type": by_type,
+            "by_persona": by_persona,
+            "target_consumer_personas": target_personas,
+            "target_consumers_without_actions": [cid for cid in target_personas if cid not in by_persona],
+            "excluded_by_origin": excluded_origin,
+            "excluded_by_evidence_role": excluded_role,
+        }
+
+    def population(self) -> List[Dict[str, Any]]:
+        """Personas with their roles and action counts by origin"""
+        rows = []
+        for p in self.persona_index.to_list():
+            cid = p["canonical_id"]
+            own = [a for a in self.actions if a["canonical_id"] == cid]
+            rows.append({
+                **p,
+                "simulation_role": self.persona_simulation_role(cid),
+                "evidence_role": self.persona_evidence_role(cid),
+                "behavioural_actions": sum(1 for a in own if self.is_behavioural(a)),
+                "excluded_actions": sum(1 for a in own if not self.is_behavioural(a)),
+            })
+        return rows
+
+    def authoritative_documents(self) -> List[Dict[str, str]]:
+        """Full texts of the sources the experiment declared authoritative (e.g. Product Truth)"""
+        from .source_requirements import authoritative_texts
+
+        return authoritative_texts(self.source_requirements, self.sources)
+
+    def persona_stage_timeline(self, canonical_id: str) -> List[Dict[str, Any]]:
+        """
+        Private stage deliveries and completions of a persona (orchestration facts, not behaviour)
+
+        Each stage is listed once (earliest round over both platforms).
+        """
+        persona = self.persona_index.personas.get(canonical_id)
+        agent_ids = set((persona or {}).get("agent_ids", []))
+        timeline: Dict[tuple, Dict[str, Any]] = {}
+        for e in self.orchestration_events:
+            if e.get("event_type") not in ("private_instruction", "stage_completed"):
+                continue
+            try:
+                if int(e.get("agent_id")) not in agent_ids:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if e.get("event_type") == "private_instruction" and e.get("status", "delivered") != "delivered":
+                continue
+            kind = "delivered" if e["event_type"] == "private_instruction" else "completed"
+            key = (e.get("stage_id"), kind)
+            round_num = e.get("round", e.get("completed_round", 0)) or 0
+            if key not in timeline or round_num < timeline[key]["round"]:
+                timeline[key] = {
+                    "stage_id": e.get("stage_id"),
+                    "stage_name": e.get("stage_name") or e.get("stage_id"),
+                    "event": kind,
+                    "round": round_num,
+                    "records": list(e.get("records") or []) if kind == "delivered" else [],
+                }
+        return sorted(timeline.values(), key=lambda x: (x["round"], x["event"] != "delivered", x["stage_id"] or ""))
+
+    def first_encounter(self, canonical_id: str, terms: List[str]) -> Optional[Dict[str, Any]]:
+        """
+        Earliest action of a persona whose own text or reacted-to content contains a term
+
+        Only the persona's own agent-generated actions count (seen content enters the
+        log through the persona's reaction to it).
+        """
+        lowered = [t.lower() for t in terms or [] if t]
+        hits = [
+            a for a in self.persona_actions(canonical_id, behavioural_only=True)
+            if any(t in f"{a.get('content') or ''} {a.get('target') or ''}".lower() for t in lowered)
+        ]
+        return min(hits, key=lambda a: (a.get("round", 0), a["timestamp"], a["ref"])) if hits else None
+
+    def persona_records(self, canonical_id: str) -> Dict[str, int]:
+        """Orchestration labels recorded for a persona (e.g. EXPOSED) with the first round"""
+        records: Dict[str, int] = {}
+        for item in self.persona_stage_timeline(canonical_id):
+            for label in item["records"]:
+                records.setdefault(label, item["round"])
+        return records
 
     def platform_counts(self) -> Dict[str, int]:
         counts: Dict[str, int] = {}
@@ -442,6 +675,7 @@ class RunEvidence:
         platform: Optional[str] = None,
         action_type: Optional[str] = None,
         limit: int = 50,
+        scope: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Filter/search raw actions of this run
@@ -452,6 +686,8 @@ class RunEvidence:
             platform: twitter / reddit
             action_type: e.g. CREATE_POST
             limit: Max results (0 = all)
+            scope: None (all, incl. seed/system content), "behavioural" (agent_generated)
+                or "consumer" (target consumers' agent_generated actions)
 
         Returns:
             Matching normalized actions, ordered by score then chronology
@@ -460,6 +696,10 @@ class RunEvidence:
         terms = [t for t in re.findall(r"\w+", (query or "").lower()) if len(t) >= 3]
         results = []
         for a in self.actions:
+            if scope == "behavioural" and not self.is_behavioural(a):
+                continue
+            if scope == "consumer" and not self.is_consumer_evidence(a):
+                continue
             if canonical and a["canonical_id"] != canonical:
                 continue
             if platform and a["platform"] != platform.lower():
@@ -477,13 +717,21 @@ class RunEvidence:
         found = [a for _, a in results]
         return found[:limit] if limit else found
 
-    def persona_actions(self, canonical_id: str) -> List[Dict[str, Any]]:
-        return [a for a in self.actions if a["canonical_id"] == canonical_id]
+    def persona_actions(self, canonical_id: str, behavioural_only: bool = False) -> List[Dict[str, Any]]:
+        return [
+            a for a in self.actions
+            if a["canonical_id"] == canonical_id and (not behavioural_only or self.is_behavioural(a))
+        ]
 
     @staticmethod
     def format_action(a: Dict[str, Any], max_chars: int = 400) -> str:
         """One-line, citeable rendering of an action"""
-        text = f"[{a['ref']}] round {a['round']} {a['platform']} {a['canonical_id']} ({a['display_name']}) {a['action_type']}"
+        text = f"[{a['ref']}] round {a['round']} {a['platform']} {a['canonical_id']} ({a['display_name']})"
+        if a.get("evidence_role"):
+            text += f" [{a.get('simulation_role')}/{a.get('evidence_role')}]"
+        text += f" {a['action_type']}"
+        if a.get("origin", ORIGIN_AGENT_GENERATED) != ORIGIN_AGENT_GENERATED:
+            text += f" [origin={a['origin']}: NOT behavioural evidence]"
         if a.get("content"):
             text += f' wrote: "{a["content"]}"'
         if a.get("target"):
@@ -494,9 +742,12 @@ class RunEvidence:
             text = text[: max_chars - 3] + "..."
         return text
 
-    def persona_transcript(self, canonical_id: str, max_chars: int = 40000) -> str:
+    def persona_transcript(self, canonical_id: str, max_chars: int = 40000, behavioural_only: bool = False) -> str:
         """Chronological transcript of one persona's actions on both platforms"""
-        actions = sorted(self.persona_actions(canonical_id), key=lambda a: (a["round"], a["timestamp"], a["ref"]))
+        actions = sorted(
+            self.persona_actions(canonical_id, behavioural_only=behavioural_only),
+            key=lambda a: (a["round"], a["timestamp"], a["ref"]),
+        )
         lines = []
         total = 0
         for a in actions:
@@ -519,7 +770,17 @@ class RunEvidence:
             p["total"] += 1
             p[a["platform"]] = p.get(a["platform"], 0) + 1
         silent = [cid for cid in self.persona_index.personas if cid not in by_persona]
+        by_origin: Dict[str, int] = {}
+        for a in self.actions:
+            by_origin[a.get("origin", ORIGIN_AGENT_GENERATED)] = by_origin.get(a.get("origin", ORIGIN_AGENT_GENERATED), 0) + 1
         return {
+            "by_origin": by_origin,
+            "behavioural_actions": by_origin.get(ORIGIN_AGENT_GENERATED, 0),
+            "consumer_metrics": self.consumer_metrics(),
+            "private_instructions_delivered": sum(
+                1 for e in self.orchestration_events
+                if e.get("event_type") == "private_instruction" and e.get("status", "delivered") == "delivered"
+            ),
             "total_actions": len(self.actions),
             "by_platform": self.platform_counts(),
             "by_action_type": by_type,
@@ -589,6 +850,12 @@ class RunEvidence:
             "integrity": self.integrity,
             "requested_persona_ids": self.requested_ids,
             "personas": self.persona_index.to_list(),
+            "population": self.population(),
+            "roles_source": self.roles_source,
+            "roles_note": self.roles_note,
+            "metric_scope": CONSUMER_METRIC_SCOPE,
+            "orchestration_events": self.orchestration_events,
+            "stage_timelines": {cid: self.persona_stage_timeline(cid) for cid in self.persona_index.personas},
             "sources_origin": self.sources_origin,
             "sources": self.source_manifest(),
             "stats": self.stats(),

@@ -495,6 +495,10 @@ Searches the complete Twitter and Reddit action logs (actions.jsonl) of the run 
 Every result carries a citeable reference such as [TW-00012] or [RD-00003].
 Filters: query (keywords, any term), persona (canonical id such as C01, or a name), platform
 (twitter/reddit), action_type (e.g. CREATE_POST, CREATE_COMMENT, LIKE_POST), limit.
+Each action shows [simulation_role/evidence_role] and, when it is not the agent's own behaviour,
+[origin=system_seed|researcher_instruction: NOT behavioural evidence]. Seed posts and leaked
+research instructions must never be described as agent behaviour. Conversion / adoption claims
+may only use actions of evidence role target_consumer.
 Use this for every statement about what agents did or said."""
 
 TOOL_DESC_PERSONA_EVIDENCE = """\
@@ -504,8 +508,10 @@ actions on both platforms. Parameter: persona (canonical id such as C01, or a na
 
 TOOL_DESC_EVIDENCE_STATS = """\
 [PRIMARY EVIDENCE - Counts and integrity]
-Returns simulation counts per platform, action type and persona, personas without any action,
-the personas requested by the assessment brief and data-integrity warnings. No parameters.
+Returns simulation counts per platform, action type, origin and persona, personas without any action,
+the personas requested by the assessment brief, the population with simulation/evidence roles,
+consumer_metrics (the only valid basis for conversion / adoption counts: target consumers'
+agent-generated actions) and data-integrity warnings. No parameters.
 Counts are simulation counts, never real-world rates."""
 
 TOOL_DESC_SOURCE_DOCUMENTS = """\
@@ -1261,6 +1267,7 @@ class ReportAgent:
             profile = persona["profiles"][0] if persona.get("profiles") else {}
             lines = [
                 f"Persona {cid} — {persona['display_name']} (agent ids {persona['agent_ids']}, names {persona['names']})",
+                f"Simulation role: {evidence.persona_simulation_role(cid)} · evidence role: {evidence.persona_evidence_role(cid)}",
                 f"Definition: {json.dumps({k: v for k, v in profile.items() if k in ('entity_type', 'bio', 'persona', 'profession', 'stance')}, ensure_ascii=False)[:1500]}",
                 f"Simulated actions: {len(actions)}",
             ]
@@ -1273,7 +1280,8 @@ class ReportAgent:
                     "run_id": evidence.run_id,
                     "stats": evidence.stats(),
                     "requested_persona_ids": evidence.requested_ids,
-                    "personas": evidence.persona_index.to_list(),
+                    "population": evidence.population(),
+                    "roles_note": evidence.roles_note,
                     "integrity_warnings": evidence.integrity.get("warnings", []),
                     "note": "Simulation counts of synthetic agents, not real-world rates.",
                 },
@@ -1292,7 +1300,8 @@ class ReportAgent:
                 "time_config": cfg.get("time_config"),
                 "event_config": cfg.get("event_config"),
                 "agents": [
-                    {"agent_id": a.get("agent_id"), "entity_name": a.get("entity_name"), "entity_type": a.get("entity_type"), "stance": a.get("stance")}
+                    {"agent_id": a.get("agent_id"), "entity_name": a.get("entity_name"), "entity_type": a.get("entity_type"),
+                     "stance": a.get("stance"), "simulation_role": a.get("simulation_role"), "evidence_role": a.get("evidence_role")}
                     for a in cfg.get("agent_configs", [])
                 ],
             }

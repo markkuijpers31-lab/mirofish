@@ -41,11 +41,41 @@
         </div>
       </div>
 
-      <!-- Step 02: Generate Agent Personas -->
-      <div class="step-card" :class="{ 'active': phase === 1, 'completed': phase > 1 }">
+      <!-- Step 02: Agent Selection (graph entity != simulation agent) -->
+      <div class="step-card" :class="{ 'active': !selectionReady, 'completed': selectionReady }">
         <div class="card-header">
           <div class="step-info">
             <span class="step-num">02</span>
+            <span class="step-title">{{ $t('agentSelection.title') }}</span>
+          </div>
+          <div class="step-status">
+            <span v-if="selectionReady" class="badge success">{{ $t('agentSelection.badgeConfirmed') }}</span>
+            <span v-else-if="selectionData" class="badge processing">{{ $t('agentSelection.badgeActionRequired') }}</span>
+            <span v-else class="badge pending">{{ $t('common.pending') }}</span>
+          </div>
+        </div>
+
+        <div class="card-content">
+          <p class="api-note">GET / PUT /api/simulation/{{ simulationId }}/agent-selection</p>
+          <p class="description">{{ $t('agentSelection.description') }}</p>
+          <p v-if="selectionError" class="description error-text">{{ selectionError }}</p>
+          <AgentSelectionPanel
+            v-if="selectionData"
+            :simulation-id="simulationId"
+            :selection="selectionData"
+            :locked="selectionLocked"
+            :busy="phase > 0 && phase < 4"
+            @confirmed="handleSelectionConfirmed"
+            @add-log="addLog"
+          />
+        </div>
+      </div>
+
+      <!-- Step 03: Generate Agent Personas -->
+      <div class="step-card" :class="{ 'active': phase === 1, 'completed': phase > 1 }">
+        <div class="card-header">
+          <div class="step-info">
+            <span class="step-num">03</span>
             <span class="step-title">{{ $t('step2.generateAgentPersona') }}</span>
           </div>
           <div class="step-status">
@@ -113,11 +143,11 @@
         </div>
       </div>
 
-      <!-- Step 03: Generate Dual-Platform Config -->
+      <!-- Step 04: Generate Dual-Platform Config -->
       <div class="step-card" :class="{ 'active': phase === 2, 'completed': phase > 2 }">
         <div class="card-header">
           <div class="step-info">
-            <span class="step-num">03</span>
+            <span class="step-num">04</span>
             <span class="step-title">{{ $t('step2.dualPlatformConfig') }}</span>
           </div>
           <div class="step-status">
@@ -346,11 +376,11 @@
         </div>
       </div>
 
-      <!-- Step 04: Initial Activation Orchestration -->
+      <!-- Step 05: Initial Activation Orchestration -->
       <div class="step-card" :class="{ 'active': phase === 3, 'completed': phase > 3 }">
         <div class="card-header">
           <div class="step-info">
-            <span class="step-num">04</span>
+            <span class="step-num">05</span>
             <span class="step-title">{{ $t('step2.initialActivation') }}</span>
           </div>
           <div class="step-status">
@@ -398,6 +428,10 @@
             <!-- Initial Post Stream -->
             <div class="initial-posts-section">
               <span class="box-label">{{ $t('step2.initialActivationSeq', { count: simulationConfig.event_config.initial_posts.length }) }}</span>
+              <p class="seed-note">{{ $t('agentSelection.seedNote') }}</p>
+              <p v-if="simulationConfig.event_config.rejected_seed_posts?.length" class="seed-note warn">
+                {{ $t('agentSelection.seedRejected', { count: simulationConfig.event_config.rejected_seed_posts.length }) }}
+              </p>
               <div class="posts-timeline">
                 <div v-for="(post, idx) in simulationConfig.event_config.initial_posts" :key="idx" class="timeline-item">
                   <div class="timeline-marker"></div>
@@ -418,11 +452,11 @@
         </div>
       </div>
 
-      <!-- Step 05: Setup Complete -->
+      <!-- Step 06: Setup Complete -->
       <div class="step-card" :class="{ 'active': phase === 4 }">
         <div class="card-header">
           <div class="step-info">
-            <span class="step-num">05</span>
+            <span class="step-num">06</span>
             <span class="step-title">{{ $t('step2.setupComplete') }}</span>
           </div>
           <div class="step-status">
@@ -634,7 +668,10 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
+import AgentSelectionPanel from './AgentSelectionPanel.vue'
+import { decideStep2MountAction } from '../utils/agentSelection'
 import {
+  getAgentSelection,
   prepareSimulation,
   getPrepareStatus,
   getSimulationProfilesRealtime,
@@ -665,6 +702,15 @@ const expectedTotal = ref(null)
 const simulationConfig = ref(null)
 const selectedProfile = ref(null)
 const showProfilesDetail = ref(true)
+
+// Agent selection: nothing is prepared until the user confirms the population
+const selectionData = ref(null)
+const selectionError = ref('')
+const selectionLocked = computed(() => Boolean(selectionData.value?.population?.prepared))
+const selectionReady = computed(() => {
+  const population = selectionData.value?.population
+  return Boolean(population?.prepared || population?.preparing || (selectionData.value?.confirmed && phase.value > 0))
+})
 
 // Log dedup: record last output key info
 let lastLoggedMessage = ''
@@ -746,6 +792,9 @@ const handlePrepareFailure = (message) => {
   stopConfigPolling()
   addLog(t('log.prepareFailedWithError', { error: message || t('common.unknownError') }))
   emit('update-status', 'error')
+  // Unlock the agent selection so the population can be fixed and prepared again
+  phase.value = 0
+  loadSelection().catch(() => {})
 }
 
 // Handle start simulation button click
@@ -811,7 +860,7 @@ const startPrepareSimulation = async () => {
       // Immediately set expected Agent total (from prepare API return value)
       if (res.data.expected_entities_count) {
         expectedTotal.value = res.data.expected_entities_count
-        addLog(t('log.graphEntitiesFound', { count: res.data.expected_entities_count }))
+        addLog(t('agentSelection.logPreparing', { active: res.data.expected_entities_count, total: res.data.graph_entities_count || '?' }))
         if (res.data.entity_types && res.data.entity_types.length > 0) {
           addLog(t('log.entityTypes', { types: res.data.entity_types.join(', ') }))
         }
@@ -827,7 +876,7 @@ const startPrepareSimulation = async () => {
       emit('update-status', 'error')
     }
   } catch (err) {
-    addLog(t('log.prepareException', { error: err.message }))
+    addLog(t('log.prepareException', { error: err?.response?.data?.error || err.message }))
     emit('update-status', 'error')
   }
 }
@@ -904,6 +953,7 @@ const pollPrepareStatus = async () => {
         addLog(t('log.prepareComplete'))
         stopPolling()
         stopProfilesPolling()
+        loadSelection().catch(() => {})
         await loadPreparedData()
       } else if (data.status === 'failed') {
         handlePrepareFailure(data.error)
@@ -1086,11 +1136,60 @@ watch(() => props.systemLogs?.length, () => {
   })
 })
 
-onMounted(() => {
-  // Auto-start preparation flow
-  if (props.simulationId) {
-    addLog(t('log.step2Init'))
-    startPrepareSimulation()
+const loadSelection = async () => {
+  const res = await getAgentSelection(props.simulationId)
+  selectionData.value = res.data
+  return res.data
+}
+
+const resetPreparedView = () => {
+  stopPolling()
+  stopProfilesPolling()
+  stopConfigPolling()
+  profiles.value = []
+  simulationConfig.value = null
+  expectedTotal.value = null
+  prepareProgress.value = 0
+  currentStage.value = ''
+  taskId.value = null
+  phase.value = 0
+}
+
+// The user confirmed the population in the Agent Selection card
+const handleSelectionConfirmed = async (selection) => {
+  selectionData.value = selection
+  if (selection.population?.prepared && !selection.preparation_invalidated) {
+    addLog(t('agentSelection.logUnchanged'))
+    return
+  }
+  resetPreparedView()
+  await startPrepareSimulation()
+}
+
+onMounted(async () => {
+  // Mounting (reload / navigation) never prepares: an explicit confirmation does
+  if (!props.simulationId) return
+  addLog(t('log.step2Init'))
+  try {
+    const selection = await loadSelection()
+    const action = decideStep2MountAction(selection.population)
+    addLog(t('agentSelection.logPopulation', { active: selection.summary.active_agents, total: selection.summary.graph_entities }))
+    if (action === 'load_prepared') {
+      startPrepareSimulation()
+    } else if (action === 'resume_prepare') {
+      phase.value = 1
+      taskId.value = selection.population.prepare_task_id
+      expectedTotal.value = selection.summary.active_agents
+      addLog(t('agentSelection.logResume'))
+      startPolling()
+      startProfilesPolling()
+    } else {
+      addLog(t('agentSelection.logAwaiting'))
+    }
+  } catch (err) {
+    selectionError.value = err?.response?.data?.error || err.message
+    addLog(t('log.prepareException', { error: selectionError.value }))
+    emit('update-status', 'error')
   }
 })
 
@@ -1102,6 +1201,10 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.error-text { color: #C62828; }
+.seed-note { font-size: 11px; color: #777; margin: 4px 0 8px; }
+.seed-note.warn { color: #D84315; font-weight: 600; }
+
 .env-setup-panel {
   height: 100%;
   display: flex;

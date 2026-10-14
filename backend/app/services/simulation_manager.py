@@ -14,9 +14,11 @@ from enum import Enum
 
 from ..config import Config
 from ..utils.logger import get_logger
+from .agent_selection import AgentSelectionStore, build_roster
 from .entity_reader import EntityReader, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
+from .research_instructions import ExperimentPlanStore, plan_from_brief, resolve_plan, validate_plan
 from ..utils.locale import t
 
 logger = get_logger("mirofish.simulation")
@@ -58,9 +60,15 @@ class SimulationState:
     status: SimulationStatus = SimulationStatus.CREATED
 
     # Preparation phase data
-    entities_count: int = 0
+    entities_count: int = 0  # eligible graph entities
     profiles_count: int = 0
     entity_types: List[str] = field(default_factory=list)
+
+    # Active population of the current preparation (graph entity != agent)
+    active_agents_count: int = 0
+    context_entities_count: int = 0
+    selection_hash: Optional[str] = None  # selection the prepared profiles were built from
+    prepare_task_id: Optional[str] = None
 
     # Profile/config generation info (both must be True for a startable simulation)
     profiles_generated: bool = False
@@ -91,6 +99,10 @@ class SimulationState:
             "entities_count": self.entities_count,
             "profiles_count": self.profiles_count,
             "entity_types": self.entity_types,
+            "active_agents_count": self.active_agents_count,
+            "context_entities_count": self.context_entities_count,
+            "selection_hash": self.selection_hash,
+            "prepare_task_id": self.prepare_task_id,
             "profiles_generated": self.profiles_generated,
             "config_generated": self.config_generated,
             "config_reasoning": self.config_reasoning,
@@ -120,6 +132,8 @@ class SimulationState:
             "entities_count": self.entities_count,
             "profiles_count": self.profiles_count,
             "entity_types": self.entity_types,
+            "active_agents_count": self.active_agents_count,
+            "context_entities_count": self.context_entities_count,
             "profiles_generated": self.profiles_generated,
             "config_generated": self.config_generated,
             "error": self.error,
@@ -191,6 +205,10 @@ class SimulationManager:
             entities_count=data.get("entities_count", 0),
             profiles_count=data.get("profiles_count", 0),
             entity_types=data.get("entity_types", []),
+            active_agents_count=data.get("active_agents_count", 0),
+            context_entities_count=data.get("context_entities_count", 0),
+            selection_hash=data.get("selection_hash"),
+            prepare_task_id=data.get("prepare_task_id"),
             # Older state files have no profiles_generated: a generated config implies profiles
             profiles_generated=data.get("profiles_generated", data.get("config_generated", False)),
             config_generated=data.get("config_generated", False),
@@ -254,13 +272,16 @@ class SimulationManager:
         use_llm_for_profiles: bool = True,
         progress_callback: Optional[callable] = None,
         parallel_profile_count: int = 3,
+        brief: Optional[Dict[str, Any]] = None,
     ) -> SimulationState:
         """
         Prepare the simulation environment (fully automated)
 
         Steps:
-        1. Read and filter entities from the graph store
-        2. Generate an OASIS Agent Profile for each entity (optional LLM enhancement, supports parallelism)
+        1. Read the eligible entities from the graph store and freeze the user's
+           confirmed agent selection into agent_roster.json
+        2. Generate an OASIS Agent Profile for each ACTIVE agent only (context-only
+           entities stay in the graph and are never accounts)
         3. Use LLM to intelligently generate simulation configuration parameters (time, activity, posting frequency, etc.)
         4. Save the configuration file and Profile files
         5. Copy preset scripts to the simulation directory
@@ -273,9 +294,14 @@ class SimulationManager:
             use_llm_for_profiles: Whether to use LLM to generate detailed personas
             progress_callback: Progress callback function (stage, progress, message)
             parallel_profile_count: Number of personas to generate in parallel, default 3
+            brief: load_project_brief() result (brief text, private instructions);
+                document_text must not contain the brief
 
         Returns:
             SimulationState
+
+        Raises:
+            ValueError: no confirmed agent selection, or an empty population
         """
         state = self._load_simulation_state(simulation_id)
         if not state:
@@ -328,8 +354,44 @@ class SimulationManager:
                     "was built correctly from the source documents"
                 )
 
-            # ========== Phase 2: Generate Agent Profiles ==========
-            total_entities = len(filtered.entities)
+            # The confirmed selection decides the population; nothing else does
+            roster = build_roster(
+                simulation_id, state.graph_id, filtered.entities,
+                AgentSelectionStore.load(simulation_id),
+            )
+            by_uuid = {e.uuid: e for e in filtered.entities}
+            active_entities = [by_uuid[a["entity_uuid"]] for a in roster["active_agents"]]
+            context_entities = [by_uuid[c["entity_uuid"]] for c in roster["context_entities"]]
+
+            # Private instruction texts (saved plan, else instructions found in the
+            # brief): kept out of personas and seed posts. The plan itself is
+            # resolved per run (RunStore.create_run), so stages are run-scoped.
+            brief = brief or {}
+            saved_plan = ExperimentPlanStore.load(simulation_id)
+            plan = validate_plan(
+                saved_plan if saved_plan is not None
+                else plan_from_brief(brief.get("brief_text", ""), brief.get("persona_ids")),
+                [r["id"] for r in roster["role_catalog"]],
+            )
+            resolved_plan = resolve_plan(
+                plan, roster, [i.get("text") for i in brief.get("instructions", [])]
+            )
+            private_texts = resolved_plan["private_texts"]
+
+            AgentSelectionStore.save_roster(simulation_id, roster)
+            state.active_agents_count = len(active_entities)
+            state.context_entities_count = len(context_entities)
+            state.selection_hash = roster["selection_hash"]
+            self._save_simulation_state(state)
+            logger.info(
+                f"Population for {simulation_id}: {len(active_entities)} active agents / "
+                f"{filtered.filtered_count} graph entities ({len(context_entities)} context-only); "
+                f"private stages={len(resolved_plan['stages'])}"
+            )
+
+
+            # ========== Phase 2: Generate Agent Profiles (active agents only) ==========
+            total_entities = len(active_entities)
 
             if progress_callback:
                 progress_callback(
@@ -365,13 +427,14 @@ class SimulationManager:
                 realtime_platform = "twitter"
 
             profiles = generator.generate_profiles_from_entities(
-                entities=filtered.entities,
+                entities=active_entities,
                 use_llm=use_llm_for_profiles,
                 progress_callback=profile_progress,
                 graph_id=state.graph_id,  # Pass graph_id for graph retrieval
                 parallel_count=parallel_profile_count,  # Parallel generation count
                 realtime_output_path=realtime_output_path,  # Real-time save path
                 output_platform=realtime_platform,  # Output format
+                private_texts=private_texts,
             )
 
             state.profiles_count = len(profiles)
@@ -443,9 +506,13 @@ class SimulationManager:
                 graph_id=state.graph_id,
                 simulation_requirement=simulation_requirement,
                 document_text=document_text,
-                entities=filtered.entities,
+                entities=active_entities,
                 enable_twitter=state.enable_twitter,
                 enable_reddit=state.enable_reddit,
+                context_entities=context_entities,
+                roster=roster,
+                private_texts=private_texts,
+                brief_text=brief.get("brief_text", ""),
             )
 
             if progress_callback:
@@ -485,7 +552,8 @@ class SimulationManager:
 
             logger.info(
                 f"Simulation preparation complete: {simulation_id}, "
-                f"entities={state.entities_count}, profiles={state.profiles_count}"
+                f"graph_entities={state.entities_count}, active_agents={state.active_agents_count}, "
+                f"profiles={state.profiles_count}"
             )
 
             return state

@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from conftest import make_project
+from conftest import make_project, select_entities
 
 from app.api.simulation import _check_simulation_prepared
 from app.services import simulation_manager as manager_module
@@ -35,6 +35,14 @@ def offline_config(monkeypatch):
 
 
 def _prepare(manager, simulation_id):
+    # Graph entities only become agents through an explicit selection (here: all of them)
+    from app.services.agent_selection import AgentSelectionStore
+    from app.services.entity_reader import EntityReader
+
+    state = manager.get_simulation(simulation_id)
+    has_entities = EntityReader().filter_defined_entities(state.graph_id, enrich_with_edges=False).filtered_count
+    if AgentSelectionStore.load(simulation_id) is None and has_entities:
+        select_entities(simulation_id)
     return manager.prepare_simulation(
         simulation_id=simulation_id,
         simulation_requirement="Assess C01-C02",
@@ -148,6 +156,17 @@ def test_prepare_api_marks_task_failed_for_an_empty_graph(uploads, client):
     LocalGraphStore("graph_empty").set_meta("empty", "", {}, "2026-01-01")
     sim_id = SimulationManager().create_simulation(project_id=project.project_id, graph_id="graph_empty").simulation_id
 
+    # Nothing can be selected in an empty graph: prepare is refused before any task starts
+    response = client.post("/api/simulation/prepare", json={"simulation_id": sim_id, "use_llm_for_profiles": False})
+    assert response.status_code == 400 and response.json["agent_selection_required"] is True
+    selection = client.get(f"/api/simulation/{sim_id}/agent-selection").json["data"]
+    assert selection["summary"]["graph_entities"] == 0
+
+    # The prepare task itself still fails cleanly on an empty graph
+    from app.services.agent_selection import AgentSelectionStore
+
+    AgentSelectionStore.save(sim_id, {"confirmed": True, "entities": [{"entity_uuid": "gone", "active": True}],
+                                      "selection_hash": "x"})
     response = client.post("/api/simulation/prepare", json={"simulation_id": sim_id, "use_llm_for_profiles": False})
     task_id = response.json["data"]["task_id"]
     deadline = time.time() + 10
