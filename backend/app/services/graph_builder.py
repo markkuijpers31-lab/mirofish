@@ -199,19 +199,11 @@ class GraphBuilderService:
         return graph_id
 
     def set_ontology(self, graph_id: str, ontology: Dict[str, Any]):
-        """Store ontology in graph metadata"""
+        """Store the ontology in the local graph metadata (as JSON)"""
         store = LocalGraphStore(graph_id)
         meta = store.get_ontology()
-        meta.update(ontology)
-        # Re-write meta with updated ontology
-        from .local_graph_store import _connect
-
-        with _connect(graph_id) as conn:
-            conn.execute(
-                "UPDATE graph_meta SET ontology=? WHERE graph_id=?",
-                (str(meta), graph_id),
-            )
-            conn.commit()
+        meta.update(ontology or {})
+        store.set_ontology(meta)
 
     def _get_graph_info(self, graph_id: str) -> GraphInfo:
         """Get graph info"""

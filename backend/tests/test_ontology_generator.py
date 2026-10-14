@@ -17,7 +17,7 @@ def test_short_ontology_context_keeps_original_text():
     context = generator._build_document_context(["short document body"])
 
     assert context == "short document body"
-    assert "长文本自动分块摘要" not in context
+    assert "[Long text, automatically chunked]" not in context
 
 
 def test_long_ontology_context_samples_across_document():
@@ -27,13 +27,13 @@ def test_long_ontology_context_samples_across_document():
     context = generator._build_document_context([long_text])
 
     assert len(context) <= generator.MAX_TEXT_LENGTH_FOR_LLM
-    assert "长文本自动分块摘要" in context
+    assert "[Long text, automatically chunked]" in context
     assert "BEGIN" in context
     assert "MIDDLE" in context
     assert "END" in context
-    assert "分块 1/" in context
-    assert "分块 3/" in context
-    assert "分块 5/" in context
+    assert "chunk 1/" in context
+    assert "chunk 3/" in context
+    assert "chunk 5/" in context
 
 
 def test_very_long_ontology_context_selects_representative_chunks():
@@ -49,4 +49,4 @@ def test_very_long_ontology_context_selects_representative_chunks():
     assert len(context) <= generator.MAX_TEXT_LENGTH_FOR_LLM
     assert "BEGIN" in context
     assert "FINALEND" in context
-    assert context.count("--- 文档 1 / 分块") == generator.MAX_LONG_TEXT_CHUNKS
+    assert context.count("--- Document 1 / chunk") == generator.MAX_LONG_TEXT_CHUNKS

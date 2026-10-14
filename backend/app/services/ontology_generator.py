@@ -9,6 +9,12 @@ from typing import Dict, Any, List, Optional
 from ..utils.llm_client import LLMClient
 from ..utils.locale import get_language_instruction
 from ..utils.logger import get_logger
+from ..utils.file_parser import split_text_into_chunks
+from ..utils.ontology import (
+    MAX_ONTOLOGY_TYPES,
+    normalize_ontology_attributes,
+    normalize_ontology_source_targets,
+)
 
 logger = get_logger("mirofish.ontology")
 
@@ -24,6 +30,17 @@ def _to_pascal_case(name: str) -> str:
     # Capitalize each word, filter empty strings
     result = "".join(word.capitalize() for word in words if word)
     return result if result else "Unknown"
+
+
+def _to_upper_snake_case(name: str) -> str:
+    """Convert free-form or camelCase names to SCREAMING_SNAKE_CASE (e.g. 'worksFor' -> 'WORKS_FOR')"""
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name.strip())
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", separated).strip("_").upper()
+    if not normalized:
+        return "UNKNOWN"
+    if normalized[0].isdigit():
+        normalized = f"REL_{normalized}"
+    return normalized
 
 
 # System prompt for ontology generation
@@ -225,6 +242,11 @@ class OntologyGenerator:
 
     # Max text length sent to LLM (50k chars)
     MAX_TEXT_LENGTH_FOR_LLM = 50000
+    # Long documents are sampled across their whole length instead of truncated
+    LONG_TEXT_CHUNK_SIZE = 8000
+    LONG_TEXT_CHUNK_OVERLAP = 200
+    MAX_LONG_TEXT_CHUNKS = 60
+    MIN_LONG_TEXT_EXCERPT = 400
 
     def _build_user_message(
         self,
@@ -234,14 +256,7 @@ class OntologyGenerator:
     ) -> str:
         """Build the user message"""
 
-        # Merge text
-        combined_text = "\n\n---\n\n".join(document_texts)
-        original_length = len(combined_text)
-
-        # If text exceeds 50k chars, truncate (only affects LLM input, not graph build)
-        if len(combined_text) > self.MAX_TEXT_LENGTH_FOR_LLM:
-            combined_text = combined_text[: self.MAX_TEXT_LENGTH_FOR_LLM]
-            combined_text += f"\n\n...(Original text is {original_length} characters; the first {self.MAX_TEXT_LENGTH_FOR_LLM} characters were retained for ontology analysis)..."
+        combined_text = self._build_document_context(document_texts)
 
         message = f"""## Simulation Requirement
 
@@ -272,145 +287,290 @@ Based on the above content, design entity types and relation types suitable for 
 
         return message
 
-    def _validate_and_process(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate and post-process the result"""
+    def _build_document_context(self, document_texts: List[str]) -> str:
+        """
+        Build the document context for ontology analysis
 
-        # Ensure required fields exist
-        if "entity_types" not in result:
-            result["entity_types"] = []
-        if "edge_types" not in result:
-            result["edge_types"] = []
-        if "analysis_summary" not in result:
+        Short input is passed unchanged. Long input is split into chunks and a
+        representative, evenly spaced sample (beginning, middle and end) is used,
+        so the ontology is not designed from the first pages only.
+        """
+        texts = [t for t in document_texts if isinstance(t, str) and t.strip()]
+        combined_text = "\n\n---\n\n".join(texts)
+        original_length = len(combined_text)
+
+        if original_length <= self.MAX_TEXT_LENGTH_FOR_LLM:
+            return combined_text
+
+        chunks = self._collect_document_chunks(texts)
+        if not chunks:
+            return ""
+
+        selected_chunks = self._select_representative_chunks(chunks)
+        excerpt_budget = self._calculate_excerpt_budget(len(selected_chunks))
+        context = self._render_chunked_context(
+            selected_chunks, original_length, len(chunks), excerpt_budget
+        )
+
+        while (
+            len(context) > self.MAX_TEXT_LENGTH_FOR_LLM
+            and excerpt_budget > self.MIN_LONG_TEXT_EXCERPT
+        ):
+            excerpt_budget = max(self.MIN_LONG_TEXT_EXCERPT, int(excerpt_budget * 0.85))
+            context = self._render_chunked_context(
+                selected_chunks, original_length, len(chunks), excerpt_budget
+            )
+
+        if len(context) > self.MAX_TEXT_LENGTH_FOR_LLM:
+            marker = "\n\n...(chunked context compressed to the ontology analysis limit)..."
+            context = context[: self.MAX_TEXT_LENGTH_FOR_LLM - len(marker)] + marker
+
+        return context
+
+    def _collect_document_chunks(self, document_texts: List[str]) -> List[Dict[str, Any]]:
+        """Chunk every document, keeping document and chunk numbers"""
+        all_chunks: List[Dict[str, Any]] = []
+        for doc_index, text in enumerate(document_texts, 1):
+            doc_chunks = split_text_into_chunks(
+                text,
+                chunk_size=self.LONG_TEXT_CHUNK_SIZE,
+                overlap=self.LONG_TEXT_CHUNK_OVERLAP,
+            )
+            for chunk_index, chunk in enumerate(doc_chunks, 1):
+                all_chunks.append({
+                    "document_index": doc_index,
+                    "chunk_index": chunk_index,
+                    "total_document_chunks": len(doc_chunks),
+                    "text": chunk,
+                })
+        return all_chunks
+
+    def _select_representative_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Evenly spaced sample covering beginning, middle and end"""
+        if len(chunks) <= self.MAX_LONG_TEXT_CHUNKS:
+            return chunks
+        if self.MAX_LONG_TEXT_CHUNKS <= 1:
+            return [chunks[0]]
+        last_index = len(chunks) - 1
+        selected = {
+            round(i * last_index / (self.MAX_LONG_TEXT_CHUNKS - 1))
+            for i in range(self.MAX_LONG_TEXT_CHUNKS)
+        }
+        return [chunks[i] for i in sorted(selected)]
+
+    def _calculate_excerpt_budget(self, selected_count: int) -> int:
+        """Character budget per selected chunk"""
+        header_budget = 600
+        chunk_header_budget = 120 * selected_count
+        available = max(
+            self.MIN_LONG_TEXT_EXCERPT * selected_count,
+            self.MAX_TEXT_LENGTH_FOR_LLM - header_budget - chunk_header_budget,
+        )
+        return max(self.MIN_LONG_TEXT_EXCERPT, available // max(selected_count, 1))
+
+    def _render_chunked_context(
+        self,
+        selected_chunks: List[Dict[str, Any]],
+        original_length: int,
+        total_chunks: int,
+        excerpt_limit: int,
+    ) -> str:
+        """Render the sampled long-text context"""
+        lines = [
+            (
+                f"[Long text, automatically chunked] The original text has {original_length} characters "
+                f"and was split into {total_chunks} chunks for full coverage."
+            ),
+            (
+                f"Below are excerpts of {len(selected_chunks)} representative chunks covering the beginning, "
+                "middle and end; design the ontology from these cross-document clues, not from the first part only."
+            ),
+        ]
+        for chunk in selected_chunks:
+            lines.append(
+                f"--- Document {chunk['document_index']} / "
+                f"chunk {chunk['chunk_index']}/{chunk['total_document_chunks']} ---\n"
+                + self._excerpt_text(chunk["text"], excerpt_limit)
+            )
+        return "\n\n".join(lines)
+
+    @staticmethod
+    def _excerpt_text(text: str, char_limit: int) -> str:
+        """Keep head and tail of a long chunk"""
+        text = text.strip()
+        if len(text) <= char_limit:
+            return text
+        marker = "\n...(middle of this chunk omitted)...\n"
+        if char_limit <= len(marker) + 20:
+            return text[:char_limit]
+        remaining = char_limit - len(marker)
+        head_len = remaining // 2
+        tail_len = remaining - head_len
+        return f"{text[:head_len].rstrip()}{marker}{text[-tail_len:].lstrip()}"
+
+    def _validate_and_process(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate and normalize the LLM ontology output
+
+        LLM output is untrusted: entity/edge entries may be strings, null or
+        malformed objects, attributes may be strings, and source_targets may
+        reference renamed or unknown types. Every entry is copied and
+        normalized; unusable entries are dropped instead of crashing.
+        """
+        if not isinstance(result, dict):
+            raise ValueError("Ontology result must be a JSON object")
+
+        raw_entities = result.get("entity_types")
+        raw_edges = result.get("edge_types")
+        if not isinstance(raw_entities, list):
+            raw_entities = []
+        if not isinstance(raw_edges, list):
+            raw_edges = []
+        if not isinstance(result.get("analysis_summary"), str):
             result["analysis_summary"] = ""
 
-        # Validate entity types
-        # Record original name to PascalCase mapping for later correction of edge source_targets references
-        entity_name_map = {}
-        for entity in result["entity_types"]:
-            # Force entity name to PascalCase
-            if "name" in entity:
-                original_name = entity["name"]
-                entity["name"] = _to_pascal_case(original_name)
-                if entity["name"] != original_name:
-                    logger.warning(
-                        f"Entity type name '{original_name}' auto-converted to '{entity['name']}'"
-                    )
-                entity_name_map[original_name] = entity["name"]
-            if "attributes" not in entity:
-                entity["attributes"] = []
-            if "examples" not in entity:
-                entity["examples"] = []
-            # Ensure description does not exceed 100 characters
-            if len(entity.get("description", "")) > 100:
-                entity["description"] = entity["description"][:97] + "..."
+        entity_name_map: Dict[str, str] = {}
+        processed_entities: List[Dict[str, Any]] = []
+        seen_entity_names = set()
+        for raw_entity in raw_entities:
+            if isinstance(raw_entity, str):
+                entity = {"name": raw_entity}
+            elif isinstance(raw_entity, dict):
+                entity = dict(raw_entity)
+            else:
+                logger.warning("Ignoring non-object ontology entity entry")
+                continue
 
-        # Validate relation types
-        for edge in result["edge_types"]:
-            # Force edge name to SCREAMING_SNAKE_CASE
-            if "name" in edge:
-                original_name = edge["name"]
-                edge["name"] = original_name.upper()
-                if edge["name"] != original_name:
-                    logger.warning(
-                        f"Edge type name '{original_name}' auto-converted to '{edge['name']}'"
-                    )
-            # Fix entity name references in source_targets to match converted PascalCase
-            for st in edge.get("source_targets", []):
-                if st.get("source") in entity_name_map:
-                    st["source"] = entity_name_map[st["source"]]
-                if st.get("target") in entity_name_map:
-                    st["target"] = entity_name_map[st["target"]]
-            if "source_targets" not in edge:
-                edge["source_targets"] = []
-            if "attributes" not in edge:
-                edge["attributes"] = []
-            if len(edge.get("description", "")) > 100:
-                edge["description"] = edge["description"][:97] + "..."
-
-        # Limit: max 10 custom entity types, max 10 custom edge types
-        MAX_ENTITY_TYPES = 10
-        MAX_EDGE_TYPES = 10
-
-        # Deduplicate: by name, keep first occurrence
-        seen_names = set()
-        deduped = []
-        for entity in result["entity_types"]:
-            name = entity.get("name", "")
-            if name and name not in seen_names:
-                seen_names.add(name)
-                deduped.append(entity)
-            elif name in seen_names:
+            original_name = entity.get("name")
+            if not isinstance(original_name, str) or not original_name.strip():
+                logger.warning("Ignoring ontology entity without a usable name")
+                continue
+            original_name = original_name.strip()
+            normalized_name = _to_pascal_case(original_name)
+            if normalized_name == "Unknown":
+                continue
+            entity_name_map[original_name] = normalized_name
+            entity_name_map[original_name.lower()] = normalized_name
+            if normalized_name in seen_entity_names:
+                logger.warning(f"Duplicate entity type '{normalized_name}' removed during validation")
+                continue
+            if normalized_name != original_name:
                 logger.warning(
-                    f"Duplicate entity type '{name}' removed during validation"
+                    f"Entity type name '{original_name}' auto-converted to '{normalized_name}'"
                 )
-        result["entity_types"] = deduped
+            entity["name"] = normalized_name
+            entity["attributes"] = normalize_ontology_attributes(entity.get("attributes", []))
+            if not isinstance(entity.get("examples"), list):
+                entity["examples"] = []
+            description = entity.get("description")
+            if not isinstance(description, str) or not description:
+                description = f"A {normalized_name} entity."
+            entity["description"] = description[:97] + "..." if len(description) > 100 else description
+
+            seen_entity_names.add(normalized_name)
+            processed_entities.append(entity)
+
+        result["entity_types"] = processed_entities
 
         # Fallback type definitions
         person_fallback = {
             "name": "Person",
             "description": "Any individual person not fitting other specific person types.",
             "attributes": [
-                {
-                    "name": "full_name",
-                    "type": "text",
-                    "description": "Full name of the person",
-                },
+                {"name": "full_name", "type": "text", "description": "Full name of the person"},
                 {"name": "role", "type": "text", "description": "Role or occupation"},
             ],
             "examples": ["ordinary citizen", "anonymous netizen"],
         }
-
         organization_fallback = {
             "name": "Organization",
             "description": "Any organization not fitting other specific organization types.",
             "attributes": [
-                {
-                    "name": "org_name",
-                    "type": "text",
-                    "description": "Name of the organization",
-                },
-                {
-                    "name": "org_type",
-                    "type": "text",
-                    "description": "Type of organization",
-                },
+                {"name": "org_name", "type": "text", "description": "Name of the organization"},
+                {"name": "org_type", "type": "text", "description": "Type of organization"},
             ],
             "examples": ["small business", "community group"],
         }
 
-        # Check if fallback types already exist
         entity_names = {e["name"] for e in result["entity_types"]}
-        has_person = "Person" in entity_names
-        has_organization = "Organization" in entity_names
-
-        # Fallback types to add
         fallbacks_to_add = []
-        if not has_person:
+        if "Person" not in entity_names:
             fallbacks_to_add.append(person_fallback)
-        if not has_organization:
+        if "Organization" not in entity_names:
             fallbacks_to_add.append(organization_fallback)
 
         if fallbacks_to_add:
-            current_count = len(result["entity_types"])
-            needed_slots = len(fallbacks_to_add)
-
-            # If adding would exceed 10, need to remove some existing types
-            if current_count + needed_slots > MAX_ENTITY_TYPES:
-                # Calculate how many to remove
-                to_remove = current_count + needed_slots - MAX_ENTITY_TYPES
-                # Remove from end (preserve more important specific types at front)
-                result["entity_types"] = result["entity_types"][:-to_remove]
-
-            # Add fallback types
+            # Keep the fallbacks within the limit by dropping trailing specific types
+            overflow = len(result["entity_types"]) + len(fallbacks_to_add) - MAX_ONTOLOGY_TYPES
+            if overflow > 0:
+                result["entity_types"] = result["entity_types"][:-overflow]
             result["entity_types"].extend(fallbacks_to_add)
 
-        # Final guard to ensure limit is not exceeded (defensive programming)
-        if len(result["entity_types"]) > MAX_ENTITY_TYPES:
-            result["entity_types"] = result["entity_types"][:MAX_ENTITY_TYPES]
+        result["entity_types"] = result["entity_types"][:MAX_ONTOLOGY_TYPES]
 
-        if len(result["edge_types"]) > MAX_EDGE_TYPES:
-            result["edge_types"] = result["edge_types"][:MAX_EDGE_TYPES]
+        valid_entity_names = {entity["name"] for entity in result["entity_types"]}
+        for name in valid_entity_names:
+            entity_name_map[name] = name
+            entity_name_map[name.lower()] = name
 
+        def resolve_entity_name(value: str) -> Optional[str]:
+            stripped = value.strip()
+            if stripped == "Entity":
+                return stripped
+            mapped = entity_name_map.get(stripped) or entity_name_map.get(stripped.lower())
+            if mapped in valid_entity_names:
+                return mapped
+            pascal_name = _to_pascal_case(stripped)
+            return pascal_name if pascal_name in valid_entity_names else None
+
+        processed_edges: List[Dict[str, Any]] = []
+        seen_edge_names = set()
+        for raw_edge in raw_edges:
+            if isinstance(raw_edge, str):
+                logger.warning(f"Ignoring ontology edge without source_targets: {raw_edge}")
+                continue
+            if not isinstance(raw_edge, dict):
+                logger.warning("Ignoring non-object ontology edge entry")
+                continue
+            edge = dict(raw_edge)
+
+            original_name = edge.get("name")
+            if not isinstance(original_name, str) or not original_name.strip():
+                logger.warning("Ignoring ontology edge without a usable name")
+                continue
+            normalized_name = _to_upper_snake_case(original_name)
+            if normalized_name == "UNKNOWN":
+                continue
+            if normalized_name in seen_edge_names:
+                logger.warning(f"Duplicate edge type '{normalized_name}' removed during validation")
+                continue
+            if normalized_name != original_name:
+                logger.warning(
+                    f"Edge type name '{original_name}' auto-converted to '{normalized_name}'"
+                )
+            edge["name"] = normalized_name
+
+            # Resolve endpoints first, then dedupe and cap, so invalid pairs
+            # never consume the limit
+            resolved_targets = []
+            for pair in normalize_ontology_source_targets(edge.get("source_targets", []), limit=None):
+                source = resolve_entity_name(pair["source"])
+                target = resolve_entity_name(pair["target"])
+                if source and target:
+                    resolved_targets.append({"source": source, "target": target})
+            edge["source_targets"] = normalize_ontology_source_targets(resolved_targets)
+            edge["attributes"] = normalize_ontology_attributes(edge.get("attributes", []))
+            description = edge.get("description")
+            if not isinstance(description, str) or not description:
+                description = f"A {normalized_name} relationship."
+            edge["description"] = description[:97] + "..." if len(description) > 100 else description
+
+            seen_edge_names.add(normalized_name)
+            processed_edges.append(edge)
+            if len(processed_edges) == MAX_ONTOLOGY_TYPES:
+                break
+
+        result["edge_types"] = processed_edges
         return result
 
     def generate_python_code(self, ontology: Dict[str, Any]) -> str:

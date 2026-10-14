@@ -62,7 +62,8 @@ class SimulationState:
     profiles_count: int = 0
     entity_types: List[str] = field(default_factory=list)
 
-    # Config generation info
+    # Profile/config generation info (both must be True for a startable simulation)
+    profiles_generated: bool = False
     config_generated: bool = False
     config_reasoning: str = ""
 
@@ -90,6 +91,7 @@ class SimulationState:
             "entities_count": self.entities_count,
             "profiles_count": self.profiles_count,
             "entity_types": self.entity_types,
+            "profiles_generated": self.profiles_generated,
             "config_generated": self.config_generated,
             "config_reasoning": self.config_reasoning,
             "current_round": self.current_round,
@@ -99,6 +101,14 @@ class SimulationState:
             "updated_at": self.updated_at,
             "error": self.error,
         }
+
+    def get_default_platform(self) -> str:
+        """Default profile platform for the enabled platforms"""
+        if self.enable_reddit:
+            return "reddit"
+        if self.enable_twitter:
+            return "twitter"
+        return "reddit"
 
     def to_simple_dict(self) -> Dict[str, Any]:
         """Simplified state dictionary (for API responses)"""
@@ -110,6 +120,7 @@ class SimulationState:
             "entities_count": self.entities_count,
             "profiles_count": self.profiles_count,
             "entity_types": self.entity_types,
+            "profiles_generated": self.profiles_generated,
             "config_generated": self.config_generated,
             "error": self.error,
         }
@@ -180,6 +191,8 @@ class SimulationManager:
             entities_count=data.get("entities_count", 0),
             profiles_count=data.get("profiles_count", 0),
             entity_types=data.get("entity_types", []),
+            # Older state files have no profiles_generated: a generated config implies profiles
+            profiles_generated=data.get("profiles_generated", data.get("config_generated", False)),
             config_generated=data.get("config_generated", False),
             config_reasoning=data.get("config_reasoning", ""),
             current_round=data.get("current_round", 0),
@@ -269,7 +282,15 @@ class SimulationManager:
             raise ValueError(t("api.simulationNotFound", id=simulation_id))
 
         try:
+            # A (re-)prepare invalidates the previous preparation until it fully
+            # succeeds, so a failed or interrupted prepare can never be started.
+            # Existing runs keep their own snapshots and are not touched.
             state.status = SimulationStatus.PREPARING
+            state.profiles_generated = False
+            state.config_generated = False
+            state.config_reasoning = ""
+            state.profiles_count = 0
+            state.error = None
             self._save_simulation_state(state)
 
             sim_dir = self._get_simulation_dir(simulation_id)
@@ -302,10 +323,10 @@ class SimulationManager:
                 )
 
             if filtered.filtered_count == 0:
-                state.status = SimulationStatus.FAILED
-                state.error = "No matching entities found; please check whether the graph is correctly built"
-                self._save_simulation_state(state)
-                return state
+                raise ValueError(
+                    "No matching entities found in the graph; please check whether the graph "
+                    "was built correctly from the source documents"
+                )
 
             # ========== Phase 2: Generate Agent Profiles ==========
             total_entities = len(filtered.entities)
@@ -381,6 +402,11 @@ class SimulationManager:
                     platform="twitter",
                 )
 
+            if not profiles:
+                raise ValueError("Persona generation produced no profiles")
+            state.profiles_generated = True
+            self._save_simulation_state(state)
+
             if progress_callback:
                 progress_callback(
                     "generating_profiles",
@@ -433,8 +459,10 @@ class SimulationManager:
 
             # Save config files
             config_path = os.path.join(sim_dir, "simulation_config.json")
-            with open(config_path, "w", encoding="utf-8") as f:
+            tmp_config_path = f"{config_path}.tmp"
+            with open(tmp_config_path, "w", encoding="utf-8") as f:
                 f.write(sim_params.to_json())
+            os.replace(tmp_config_path, config_path)
 
             state.config_generated = True
             state.config_reasoning = sim_params.generation_reasoning
@@ -468,6 +496,7 @@ class SimulationManager:
 
             logger.error(traceback.format_exc())
             state.status = SimulationStatus.FAILED
+            state.config_generated = False
             state.error = str(e)
             self._save_simulation_state(state)
             raise
@@ -497,18 +526,41 @@ class SimulationManager:
         return simulations
 
     def get_profiles(
-        self, simulation_id: str, platform: str = "reddit"
+        self, simulation_id: str, platform: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Get the simulation's Agent Profile"""
+        """
+        Get the simulation's Agent Profiles
+
+        Args:
+            simulation_id: Simulation ID
+            platform: "reddit" (JSON) or "twitter" (CSV); default depends on the enabled platforms
+
+        Raises:
+            ValueError: unknown simulation or unsupported platform
+        """
         state = self._load_simulation_state(simulation_id)
         if not state:
             raise ValueError(t("api.simulationNotFound", id=simulation_id))
 
+        if platform is None:
+            platform = state.get_default_platform()
+        if platform not in {"twitter", "reddit"}:
+            raise ValueError(f"Unsupported platform: {platform}")
+
         sim_dir = self._get_simulation_dir(simulation_id)
-        profile_path = os.path.join(sim_dir, f"{platform}_profiles.json")
+        profile_path = os.path.join(
+            sim_dir,
+            "twitter_profiles.csv" if platform == "twitter" else "reddit_profiles.json",
+        )
 
         if not os.path.exists(profile_path):
             return []
+
+        if platform == "twitter":
+            import csv
+
+            with open(profile_path, "r", encoding="utf-8", newline="") as f:
+                return list(csv.DictReader(f))
 
         with open(profile_path, "r", encoding="utf-8") as f:
             return json.load(f)

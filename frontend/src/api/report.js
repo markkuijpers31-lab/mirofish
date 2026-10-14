@@ -1,8 +1,8 @@
 import service from './index'
 
 /**
- * Start report generation
- * @param {Object} data - { simulation_id, force_regenerate? }
+ * Start report generation (never starts or restarts a simulation)
+ * @param {Object} data - { simulation_id, run_id?, force_regenerate? }
  */
 export const generateReport = (data) => {
   return service.post('/api/report/generate', data)
@@ -48,4 +48,13 @@ export const getReport = (reportId) => {
  */
 export const chatWithReport = (data) => {
   return service.post('/api/report/chat', data)
+}
+
+/**
+ * URL of the complete run export bundle (ZIP) of a report
+ * @param {string} reportId
+ * @returns {string}
+ */
+export const getReportExportUrl = (reportId) => {
+  return `${service.defaults.baseURL || ''}/api/report/${reportId}/export`
 }

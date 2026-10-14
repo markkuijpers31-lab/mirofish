@@ -7,6 +7,7 @@ import os
 import sys
 import logging
 from datetime import datetime
+from typing import Optional
 from logging.handlers import RotatingFileHandler
 
 
@@ -103,6 +104,56 @@ def get_logger(name: str = "mirofish") -> logging.Logger:
     if not logger.handlers:
         return setup_logger(name)
     return logger
+
+
+def run_log_prefix(
+    simulation_id: Optional[str], run_id: Optional[str] = None, area: Optional[str] = None
+) -> str:
+    """
+    Build the standard run-scoped log prefix, e.g. "[sim_x][run_y][twitter]"
+
+    Args:
+        simulation_id: Simulation ID
+        run_id: Run (execution) ID
+        area: Optional area tag (twitter, reddit, report, ...)
+
+    Returns:
+        Prefix string
+    """
+    parts = [simulation_id or "sim_?", run_id or "run_?"]
+    if area:
+        parts.append(area)
+    return "".join(f"[{p}]" for p in parts)
+
+
+class RunLoggerAdapter(logging.LoggerAdapter):
+    """Logger adapter that prefixes every message with the run-scoped prefix"""
+
+    def process(self, msg, kwargs):
+        return f"{self.extra['prefix']} {msg}", kwargs
+
+
+def get_run_logger(
+    name: str,
+    simulation_id: Optional[str],
+    run_id: Optional[str] = None,
+    area: Optional[str] = None,
+) -> RunLoggerAdapter:
+    """
+    Get a logger whose messages always carry simulation_id and run_id
+
+    Args:
+        name: Logger name (e.g. 'mirofish.simulation_runner')
+        simulation_id: Simulation ID
+        run_id: Run (execution) ID
+        area: Optional area tag
+
+    Returns:
+        RunLoggerAdapter
+    """
+    return RunLoggerAdapter(
+        get_logger(name), {"prefix": run_log_prefix(simulation_id, run_id, area)}
+    )
 
 
 # Create default logger

@@ -5,6 +5,7 @@ Stores nodes, edges, episodes, and embeddings per graph.
 
 import os
 import json
+import re
 import sqlite3
 import uuid
 from typing import Dict, Any, List, Optional
@@ -178,9 +179,54 @@ class LocalGraphStore:
             row = conn.execute(
                 "SELECT ontology FROM graph_meta WHERE graph_id=?", (self.graph_id,)
             ).fetchone()
-            if row:
+            if not row or not row["ontology"]:
+                return {}
+            try:
                 return json.loads(row["ontology"])
-            return {}
+            except (TypeError, ValueError):
+                # Graphs built before the JSON fix stored a Python repr
+                logger.warning(f"Unreadable ontology metadata in graph {self.graph_id}; ignoring it")
+                return {}
+
+    def set_ontology(self, ontology: Dict[str, Any]):
+        """Persist the ontology as JSON (creates the meta row if missing)"""
+        payload = json.dumps(ontology or {}, ensure_ascii=False)
+        with _connect(self.graph_id) as conn:
+            updated = conn.execute(
+                "UPDATE graph_meta SET ontology=? WHERE graph_id=?",
+                (payload, self.graph_id),
+            ).rowcount
+            if not updated:
+                conn.execute(
+                    "INSERT INTO graph_meta (graph_id, name, description, ontology, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
+                    (self.graph_id, self.graph_id, "", payload),
+                )
+            conn.commit()
+
+    def update_node(
+        self,
+        node_uuid: str,
+        name: Optional[str] = None,
+        summary: Optional[str] = None,
+        attributes: Optional[Dict[str, Any]] = None,
+    ):
+        """Update mutable node fields (used when merging name variants of one entity)"""
+        sets, params = [], []
+        if name is not None:
+            sets.append("name=?")
+            params.append(name)
+        if summary is not None:
+            sets.append("summary=?")
+            params.append(summary)
+        if attributes is not None:
+            sets.append("attributes=?")
+            params.append(json.dumps(attributes, ensure_ascii=False))
+        if not sets:
+            return
+        params.append(node_uuid)
+        with _connect(self.graph_id) as conn:
+            conn.execute(f"UPDATE nodes SET {', '.join(sets)} WHERE uuid=?", params)
+            conn.commit()
 
     def add_episode(self, data: str, episode_type: str = "text") -> str:
         ep_uuid = str(uuid.uuid4())
@@ -306,14 +352,14 @@ class LocalGraphStore:
     def get_all_nodes(self) -> List[LocalNode]:
         with _connect(self.graph_id) as conn:
             rows = conn.execute(
-                "SELECT * FROM nodes WHERE graph_id=?", (self.graph_id,)
+                "SELECT * FROM nodes WHERE graph_id=? ORDER BY rowid", (self.graph_id,)
             ).fetchall()
             return [self._row_to_node(r) for r in rows]
 
     def get_all_edges(self) -> List[LocalEdge]:
         with _connect(self.graph_id) as conn:
             rows = conn.execute(
-                "SELECT * FROM edges WHERE graph_id=?", (self.graph_id,)
+                "SELECT * FROM edges WHERE graph_id=? ORDER BY rowid", (self.graph_id,)
             ).fetchall()
             return [self._row_to_edge(r) for r in rows]
 
@@ -337,13 +383,40 @@ class LocalGraphStore:
             return [self._row_to_node(r) for r in rows]
 
     def search_edges(self, query: str, limit: int = 20) -> List[LocalEdge]:
-        pattern = f"%{query}%"
+        """
+        Keyword search over edge facts
+
+        A natural-language query rarely occurs verbatim in a fact, so the query is
+        split into terms (3+ chars, common stopwords dropped); edges matching any
+        term are ranked by the number of matching terms.
+        """
+        terms = _query_terms(query)
+        if not terms:
+            pattern = f"%{query}%"
+            with _connect(self.graph_id) as conn:
+                rows = conn.execute(
+                    "SELECT * FROM edges WHERE graph_id=? AND (fact LIKE ? OR name LIKE ?) LIMIT ?",
+                    (self.graph_id, pattern, pattern, limit),
+                ).fetchall()
+                return [self._row_to_edge(r) for r in rows]
+
+        clause = " OR ".join(["fact LIKE ? OR name LIKE ?"] * len(terms))
+        params: List[Any] = [self.graph_id]
+        for term in terms:
+            params += [f"%{term}%", f"%{term}%"]
         with _connect(self.graph_id) as conn:
             rows = conn.execute(
-                "SELECT * FROM edges WHERE graph_id=? AND (fact LIKE ? OR name LIKE ?) LIMIT ?",
-                (self.graph_id, pattern, pattern, limit),
+                f"SELECT * FROM edges WHERE graph_id=? AND ({clause}) LIMIT 2000",
+                params,
             ).fetchall()
-            return [self._row_to_edge(r) for r in rows]
+        edges = [self._row_to_edge(r) for r in rows]
+
+        def score(edge: LocalEdge) -> int:
+            text = f"{edge.fact} {edge.name}".lower()
+            return sum(1 for term in terms if term in text)
+
+        edges.sort(key=score, reverse=True)
+        return edges[:limit]
 
     def get_statistics(self) -> Dict[str, Any]:
         with _connect(self.graph_id) as conn:
@@ -424,3 +497,20 @@ class LocalGraphStore:
 def delete_graph(graph_id: str):
     store = LocalGraphStore(graph_id)
     store.delete()
+
+
+_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "what", "how", "why", "who", "are", "was",
+    "were", "from", "into", "about", "does", "did", "have", "has", "will", "would", "their",
+    "they", "them", "which", "when", "where", "there", "been", "between", "over", "under",
+    "een", "het", "van", "voor", "met", "die", "dat", "wat", "hoe", "zijn", "wordt", "niet",
+}
+
+
+def _query_terms(query: str) -> List[str]:
+    """Search terms of a free-text query (lower-case, 3+ chars, no stopwords)"""
+    terms = []
+    for term in re.findall(r"\w+", (query or "").lower()):
+        if len(term) >= 3 and term not in _STOPWORDS and term not in terms:
+            terms.append(term)
+    return terms[:12]

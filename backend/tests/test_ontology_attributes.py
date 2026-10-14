@@ -1,14 +1,11 @@
 from app.services.ontology_generator import OntologyGenerator
 from app.services.graph_builder import GraphBuilderService
+from app.services.local_graph_store import LocalGraphStore
 from app.utils.ontology import (
     MAX_ONTOLOGY_ATTRIBUTES,
     MAX_ONTOLOGY_SOURCE_TARGETS,
     normalize_ontology_attribute,
     normalize_ontology_attributes,
-)
-from zep_cloud.external_clients.ontology import (
-    edge_model_to_api_schema,
-    entity_model_to_api_schema,
 )
 
 
@@ -31,7 +28,7 @@ def test_reject_unusable_attribute_shapes():
         assert normalize_ontology_attribute(value) is None
 
 
-def test_attribute_list_is_non_empty_and_capped_for_zep():
+def test_attribute_list_is_non_empty_and_capped():
     assert normalize_ontology_attributes(None) == [{
         "name": "details",
         "type": "text",
@@ -75,135 +72,71 @@ def test_generator_adds_a_property_to_empty_custom_types():
     assert result["edge_types"][0]["attributes"][0]["name"] == "details"
 
 
-def test_graph_builder_safety_net_accepts_strings_and_skips_invalid_values():
-    captured = {}
-
-    class GraphApi:
-        def set_ontology(self, **kwargs):
-            captured.update(kwargs)
-
-    class Client:
-        graph = GraphApi()
-
-    builder = object.__new__(GraphBuilderService)
-    builder.client = Client()
-    builder.set_ontology("graph-id", {
-        "entity_types": [{
-            "name": "Speaker",
-            "attributes": ["role", None, {"name": "summary"}],
-        }],
+def test_graph_builder_stores_the_ontology_as_json_in_the_local_graph(uploads):
+    builder = GraphBuilderService()
+    graph_id = builder.create_graph("Test graph")
+    ontology = OntologyGenerator(llm_client=object())._validate_and_process({
+        "entity_types": [{"name": "Speaker", "attributes": ["role", None]}],
         "edge_types": [],
     })
 
-    speaker = captured["entities"]["Speaker"]
-    assert set(speaker.__annotations__) == {"role", "entity_summary"}
+    builder.set_ontology(graph_id, ontology)
+    # A second update must still read the stored metadata (was a Python repr before)
+    builder.set_ontology(graph_id, {"analysis_summary": "updated"})
+
+    stored = LocalGraphStore(graph_id).get_ontology()
+    assert stored["entity_types"][0]["name"] == "Speaker"
+    assert stored["entity_types"][0]["attributes"][0]["name"] == "role"
+    assert stored["analysis_summary"] == "updated"
 
 
-def test_graph_builder_emits_a_pinned_zep_sdk_compatible_schema():
-    captured = {}
-
-    class GraphApi:
-        def set_ontology(self, **kwargs):
-            captured.update(kwargs)
-
-    class Client:
-        graph = GraphApi()
-
-    builder = object.__new__(GraphBuilderService)
-    builder.client = Client()
-    builder.set_ontology("graph-id", {
-        "entity_types": [{
-            "name": "Speaker",
-            "attributes": ["graph_id"] + [
-                f"field_{index}" for index in range(10)
-            ],
-        }],
-        "edge_types": [{
-            "name": "MENTIONS",
-            "attributes": [],
-            "source_targets": [{"source": "Speaker", "target": "Speaker"}],
-        }],
-    })
-
-    assert captured["graph_ids"] == ["graph-id"]
-
-    speaker = captured["entities"]["Speaker"]
-    entity_schema = entity_model_to_api_schema(speaker, "Speaker")
-    assert len(entity_schema["properties"]) == MAX_ONTOLOGY_ATTRIBUTES
-    assert entity_schema["properties"][0] == {
-        "name": "entity_graph_id",
-        "type": "Text",
-        "description": "graph_id",
-    }
-
-    mentions, source_targets = captured["edges"]["MENTIONS"]
-    edge_schema = edge_model_to_api_schema(mentions, "MENTIONS")
-    assert edge_schema["properties"] == [{
-        "name": "details",
-        "type": "Text",
-        "description": "Additional details about this ontology type.",
-    }]
-    assert source_targets[0].source == "Speaker"
-    assert source_targets[0].target == "Speaker"
-
-
-def test_graph_builder_passes_an_empty_entity_mapping_for_edge_only_ontology():
-    captured = {}
-
-    class GraphApi:
-        def set_ontology(self, **kwargs):
-            captured.update(kwargs)
-
-    class Client:
-        graph = GraphApi()
-
-    builder = object.__new__(GraphBuilderService)
-    builder.client = Client()
-    builder.set_ontology("graph-id", {
+def test_edge_only_ontology_round_trips_through_the_local_graph(uploads):
+    builder = GraphBuilderService()
+    graph_id = builder.create_graph("Edges only")
+    builder.set_ontology(graph_id, {
         "entity_types": [],
         "edge_types": [{
             "name": "RELATED_TO",
-            "attributes": ["reason"],
+            "attributes": [{"name": "reason", "type": "text", "description": "reason"}],
             "source_targets": [{"source": "Entity", "target": "Entity"}],
         }],
     })
 
-    assert captured["entities"] == {}
+    stored = LocalGraphStore(graph_id).get_ontology()
+    assert stored["entity_types"] == []
+    assert stored["edge_types"][0]["source_targets"] == [{"source": "Entity", "target": "Entity"}]
 
 
-def test_graph_builder_deduplicates_and_caps_edge_source_targets_for_zep():
-    captured = {}
+def test_legacy_python_repr_ontology_metadata_does_not_crash(uploads):
+    from app.services.local_graph_store import _connect
 
-    class GraphApi:
-        def set_ontology(self, **kwargs):
-            captured.update(kwargs)
+    store = LocalGraphStore("legacy_graph")
+    store.set_meta("legacy", "", {}, "2026-01-01")
+    with _connect("legacy_graph") as conn:
+        conn.execute("UPDATE graph_meta SET ontology=? WHERE graph_id=?", ("{'entity_types': []}", "legacy_graph"))
+        conn.commit()
 
-    class Client:
-        graph = GraphApi()
+    assert store.get_ontology() == {}
+    GraphBuilderService().set_ontology("legacy_graph", {"entity_types": [{"name": "Person"}]})
+    assert store.get_ontology()["entity_types"] == [{"name": "Person"}]
 
+
+def test_generator_dedupes_and_caps_edge_source_targets():
+    entity_names = [f"Type{index}" for index in range(8)]
+    pairs = [(a, b) for a in entity_names for b in entity_names if a != b]
     source_targets = [
-        {"source": f"Source{index}", "target": f"Target{index}"}
-        for index in range(MAX_ONTOLOGY_SOURCE_TARGETS + 2)
+        {"source": a, "target": b} for a, b in pairs[: MAX_ONTOLOGY_SOURCE_TARGETS + 2]
     ]
     source_targets.insert(1, dict(source_targets[0]))
 
-    builder = object.__new__(GraphBuilderService)
-    builder.client = Client()
-    builder.set_ontology("graph-id", {
-        "entity_types": [],
-        "edge_types": [{
-            "name": "RELATED_TO",
-            "attributes": ["reason"],
-            "source_targets": source_targets,
-        }],
+    result = OntologyGenerator(llm_client=object())._validate_and_process({
+        "entity_types": [{"name": name} for name in entity_names],
+        "edge_types": [{"name": "RELATED_TO", "source_targets": source_targets}],
     })
 
-    _, normalized_targets = captured["edges"]["RELATED_TO"]
-    assert len(normalized_targets) == MAX_ONTOLOGY_SOURCE_TARGETS
-    assert [(item.source, item.target) for item in normalized_targets] == [
-        (f"Source{index}", f"Target{index}")
-        for index in range(MAX_ONTOLOGY_SOURCE_TARGETS)
-    ]
+    targets = result["edge_types"][0]["source_targets"]
+    assert len(targets) == MAX_ONTOLOGY_SOURCE_TARGETS
+    assert len({(t["source"], t["target"]) for t in targets}) == len(targets)
 
 
 def test_generator_ignores_invalid_entries_and_normalizes_edge_names():

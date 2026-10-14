@@ -10,6 +10,7 @@ Optimization improvements:
 
 import json
 import random
+import zlib
 import time
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
@@ -334,6 +335,9 @@ class OasisProfileGenerator:
                 entity_attributes=entity.attributes,
             )
 
+        # Deterministic social metrics per entity
+        rng = random.Random(zlib.crc32(name.encode("utf-8")))
+
         return OasisAgentProfile(
             user_id=user_id,
             user_name=user_name,
@@ -342,13 +346,13 @@ class OasisProfileGenerator:
             persona=profile_data.get(
                 "persona", entity.summary or f"A {entity_type} named {name}."
             ),
-            karma=profile_data.get("karma", random.randint(500, 5000)),
-            friend_count=profile_data.get("friend_count", random.randint(50, 500)),
+            karma=profile_data.get("karma", rng.randint(500, 5000)),
+            friend_count=profile_data.get("friend_count", rng.randint(50, 500)),
             follower_count=profile_data.get(
-                "follower_count", random.randint(100, 1000)
+                "follower_count", rng.randint(100, 1000)
             ),
             statuses_count=profile_data.get(
-                "statuses_count", random.randint(100, 2000)
+                "statuses_count", rng.randint(100, 2000)
             ),
             age=profile_data.get("age"),
             gender=profile_data.get("gender"),
@@ -361,13 +365,17 @@ class OasisProfileGenerator:
         )
 
     def _generate_username(self, name: str) -> str:
-        """Generate a username"""
+        """
+        Generate a deterministic username from the entity name
+
+        The same entity name always yields the same username (stable suffix from a
+        checksum), so repeated preparations produce comparable profiles.
+        """
         # Remove special chars, convert to lowercase
         username = name.lower().replace(" ", "_")
-        username = "".join(c for c in username if c.isalnum() or c == "_")
+        username = "".join(c for c in username if c.isalnum() or c == "_") or "agent"
 
-        # Add random suffix to avoid duplicates
-        suffix = random.randint(100, 999)
+        suffix = 100 + zlib.crc32(name.encode("utf-8")) % 900
         return f"{username}_{suffix}"
 
     def _search_graph_for_entity(self, entity: EntityNode) -> Dict[str, Any]:
@@ -771,7 +779,7 @@ Please generate JSON containing the following fields:
 3. age: the age as a number (must be an integer)
 4. gender: gender, must be in English: "male" or "female"
 5. mbti: MBTI type (e.g. INTJ, ENFP, etc.)
-6. country: country (use Chinese, e.g. "China")
+6. country: country of residence as stated or clearly implied by the entity information/context; "Unknown" if it is not stated (never invent one)
 7. profession: occupation
 8. interested_topics: an array of topics of interest
 
@@ -824,7 +832,7 @@ Please generate JSON containing the following fields:
 3. age: fixed value 30 (the virtual age of an organizational account)
 4. gender: fixed value "other" (organizational accounts use "other" to indicate non-individual)
 5. mbti: MBTI type, used to describe the account style, e.g. ISTJ represents rigorous and conservative
-6. country: country (use Chinese, e.g. "China")
+6. country: country of residence as stated or clearly implied by the entity information/context; "Unknown" if it is not stated (never invent one)
 7. profession: description of the organization's functions
 8. interested_topics: an array of focus areas
 
@@ -844,6 +852,9 @@ Important:
     ) -> Dict[str, Any]:
         """Generate a basic persona using rules"""
 
+        # Deterministic per entity: the same entity always gets the same basic persona
+        rng = random.Random(zlib.crc32(entity_name.encode("utf-8")))
+
         # Generate different personas based on entity type
         entity_type_lower = entity_type.lower()
 
@@ -851,10 +862,10 @@ Important:
             return {
                 "bio": f"{entity_type} with interests in academics and social issues.",
                 "persona": f"{entity_name} is a {entity_type.lower()} who is actively engaged in academic and social discussions. They enjoy sharing perspectives and connecting with peers.",
-                "age": random.randint(18, 30),
-                "gender": random.choice(["male", "female"]),
-                "mbti": random.choice(self.MBTI_TYPES),
-                "country": random.choice(self.COUNTRIES),
+                "age": rng.randint(18, 30),
+                "gender": rng.choice(["male", "female"]),
+                "mbti": rng.choice(self.MBTI_TYPES),
+                "country": "Unknown",
                 "profession": "Student",
                 "interested_topics": ["Education", "Social Issues", "Technology"],
             }
@@ -863,10 +874,10 @@ Important:
             return {
                 "bio": f"Expert and thought leader in their field.",
                 "persona": f"{entity_name} is a recognized {entity_type.lower()} who shares insights and opinions on important matters. They are known for their expertise and influence in public discourse.",
-                "age": random.randint(35, 60),
-                "gender": random.choice(["male", "female"]),
-                "mbti": random.choice(["ENTJ", "INTJ", "ENTP", "INTP"]),
-                "country": random.choice(self.COUNTRIES),
+                "age": rng.randint(35, 60),
+                "gender": rng.choice(["male", "female"]),
+                "mbti": rng.choice(["ENTJ", "INTJ", "ENTP", "INTP"]),
+                "country": "Unknown",
                 "profession": entity_attributes.get("occupation", "Expert"),
                 "interested_topics": ["Politics", "Economics", "Culture & Society"],
             }
@@ -878,7 +889,7 @@ Important:
                 "age": 30,  # Virtual age for institution
                 "gender": "other",  # Institution uses 'other'
                 "mbti": "ISTJ",  # Institution style: rigorous and conservative
-                "country": "China",
+                "country": "Unknown",
                 "profession": "Media",
                 "interested_topics": [
                     "General News",
@@ -899,7 +910,7 @@ Important:
                 "age": 30,  # Virtual age for institution
                 "gender": "other",  # Institution uses 'other'
                 "mbti": "ISTJ",  # Institution style: rigorous and conservative
-                "country": "China",
+                "country": "Unknown",
                 "profession": entity_type,
                 "interested_topics": [
                     "Public Policy",
@@ -916,10 +927,10 @@ Important:
                 else f"{entity_type}: {entity_name}",
                 "persona": entity_summary
                 or f"{entity_name} is a {entity_type.lower()} participating in social discussions.",
-                "age": random.randint(25, 50),
-                "gender": random.choice(["male", "female"]),
-                "mbti": random.choice(self.MBTI_TYPES),
-                "country": random.choice(self.COUNTRIES),
+                "age": rng.randint(25, 50),
+                "gender": rng.choice(["male", "female"]),
+                "mbti": rng.choice(self.MBTI_TYPES),
+                "country": "Unknown",
                 "profession": entity_type,
                 "interested_topics": ["General", "Social Issues"],
             }
@@ -1277,7 +1288,7 @@ Important:
                 "age": profile.age if profile.age else 30,
                 "gender": self._normalize_gender(profile.gender),
                 "mbti": profile.mbti if profile.mbti else "ISTJ",
-                "country": profile.country if profile.country else "China",
+                "country": profile.country if profile.country else "Unknown",
             }
 
             # Optional fields

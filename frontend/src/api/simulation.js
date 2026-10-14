@@ -77,11 +77,23 @@ export const listSimulations = (projectId) => {
 }
 
 /**
- * Start simulation
- * @param {Object} data - { simulation_id, platform?, max_rounds?, enable_graph_memory_update? }
+ * Start simulation (idempotent: an existing run is reported, never replaced)
+ * Not retried automatically: starting a run costs LLM budget and must stay an explicit action.
+ * @param {Object} data - { simulation_id, platform?, max_rounds?, new_run? }
+ *   new_run: true only for an explicit, confirmed restart (creates a NEW run, keeps the old one)
+ * @returns {Promise} data: { run_id, run_status, started, already_running, run_exists, ... }
  */
 export const startSimulation = (data) => {
-  return requestWithRetry(() => service.post('/api/simulation/start', data), 3, 1000)
+  return service.post('/api/simulation/start', data)
+}
+
+/**
+ * List all runs (executions) of a simulation
+ * @param {string} simulationId
+ * @returns {Promise} data: { current_run_id, runs: [...] }
+ */
+export const getSimulationRuns = (simulationId) => {
+  return service.get(`/api/simulation/${simulationId}/runs`)
 }
 
 /**
@@ -93,19 +105,23 @@ export const stopSimulation = (data) => {
 }
 
 /**
- * Get simulation run real-time status
+ * Get simulation run real-time status (includes persistent run_id / run_status)
  * @param {string} simulationId
+ * @param {string} [runId] - Optional, default: current run
  */
-export const getRunStatus = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/run-status`)
+export const getRunStatus = (simulationId, runId) => {
+  const params = runId ? { run_id: runId } : {}
+  return service.get(`/api/simulation/${simulationId}/run-status`, { params })
 }
 
 /**
  * Get simulation run detailed status (including recent actions)
  * @param {string} simulationId
+ * @param {string} [runId] - Optional, default: current run
  */
-export const getRunStatusDetail = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/run-status/detail`)
+export const getRunStatusDetail = (simulationId, runId) => {
+  const params = runId ? { run_id: runId } : {}
+  return service.get(`/api/simulation/${simulationId}/run-status/detail`, { params })
 }
 
 /**

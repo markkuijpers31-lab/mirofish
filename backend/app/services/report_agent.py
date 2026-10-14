@@ -1,10 +1,14 @@
 """
 Report Agent service.
 
-Uses LangChain + local graph store to implement a ReACT-pattern simulation report generator.
+ReACT-pattern simulation report generator.
+
+Evidence model: the raw action logs of ONE simulation run are the primary source
+of truth (run_evidence.RunEvidence); the local graph store (facts extracted from
+the source documents) is a supplementary retrieval source only.
 
 Features:
-1. Generate reports based on simulation requirements and graph store information.
+1. Generate reports from a run's raw simulation evidence, source documents and assessment brief.
 2. Plan the outline structure first, then generate section by section.
 3. Each section uses a ReACT multi-round thinking-and-reflection pattern.
 4. Support chatting with the user, autonomously invoking retrieval tools during the conversation.
@@ -21,8 +25,18 @@ from enum import Enum
 
 from ..config import Config
 from ..utils.llm_client import LLMClient
-from ..utils.logger import get_logger
+from ..utils.logger import get_logger, get_run_logger
 from ..utils.locale import get_language_instruction, t
+from ..utils.persona_ids import parse_identifier
+from .assessment_spec import AssessmentSpec, extract_assessment_spec
+from .run_evidence import RunEvidence
+from .report_evidence_sections import (
+    APPENDIX_SECTION_TITLE,
+    HYPOTHESIS_SECTION_TITLE,
+    PERSONA_SECTION_TITLE,
+    STRUCTURED_SECTION_TITLES,
+    StructuredReportBuilder,
+)
 from .graph_tools import (
     GraphToolsService,
     SearchResult,
@@ -451,11 +465,13 @@ class Report:
     created_at: str = ""
     completed_at: str = ""
     error: Optional[str] = None
+    run_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "report_id": self.report_id,
             "simulation_id": self.simulation_id,
+            "run_id": self.run_id,
             "graph_id": self.graph_id,
             "simulation_requirement": self.simulation_requirement,
             "status": self.status.value,
@@ -473,7 +489,38 @@ class Report:
 
 # ── Tool Descriptions ──
 
+TOOL_DESC_SIMULATION_ACTIONS = """\
+[PRIMARY EVIDENCE - Raw simulation actions of this run]
+Searches the complete Twitter and Reddit action logs (actions.jsonl) of the run this report is about.
+Every result carries a citeable reference such as [TW-00012] or [RD-00003].
+Filters: query (keywords, any term), persona (canonical id such as C01, or a name), platform
+(twitter/reddit), action_type (e.g. CREATE_POST, CREATE_COMMENT, LIKE_POST), limit.
+Use this for every statement about what agents did or said."""
+
+TOOL_DESC_PERSONA_EVIDENCE = """\
+[PRIMARY EVIDENCE - Everything one persona did]
+Returns the persona definition and the complete chronological list of that persona's simulated
+actions on both platforms. Parameter: persona (canonical id such as C01, or a name)."""
+
+TOOL_DESC_EVIDENCE_STATS = """\
+[PRIMARY EVIDENCE - Counts and integrity]
+Returns simulation counts per platform, action type and persona, personas without any action,
+the personas requested by the assessment brief and data-integrity warnings. No parameters.
+Counts are simulation counts, never real-world rates."""
+
+TOOL_DESC_SOURCE_DOCUMENTS = """\
+[CONTEXT - Source documents and assessment brief]
+Returns text from the uploaded source documents (PDF/MD/TXT) of this run's project.
+Parameters: name (optional, part of a filename), query (optional keywords).
+Source documents describe the product/context; they are not evidence of simulated behaviour."""
+
+TOOL_DESC_SIMULATION_CONFIG = """\
+[CONTEXT - Simulation configuration]
+Returns the run's simulation configuration: time settings, initial posts/events, hot topics and
+the configured agents (entity names and types). No parameters."""
+
 TOOL_DESC_INSIGHT_FORGE = """\
+[SUPPLEMENTARY - graph of facts extracted from the SOURCE DOCUMENTS, not simulation actions]
 [Deep Insight Retrieval - Powerful Retrieval Tool]
 This is our powerful retrieval function, designed for deep analysis. It will:
 1. Automatically decompose your question into multiple sub-questions
@@ -492,6 +539,7 @@ This is our powerful retrieval function, designed for deep analysis. It will:
 - Relationship chain analysis"""
 
 TOOL_DESC_PANORAMA_SEARCH = """\
+[SUPPLEMENTARY - graph of facts extracted from the SOURCE DOCUMENTS, not simulation actions]
 [Breadth Search - Get the Full Picture View]
 This tool is used to get the complete picture of simulation results, especially suited for understanding how events evolve. It will:
 1. Retrieve all relevant nodes and relationships
@@ -509,6 +557,7 @@ This tool is used to get the complete picture of simulation results, especially 
 - All involved entities"""
 
 TOOL_DESC_QUICK_SEARCH = """\
+[SUPPLEMENTARY - graph of facts extracted from the SOURCE DOCUMENTS, not simulation actions]
 [Quick Search - Fast Retrieval]
 A lightweight fast retrieval tool, suitable for simple, direct information queries.
 
@@ -545,70 +594,61 @@ Functional flow:
 - Key quotes (directly quotable)
 - Interview summaries and perspective comparisons
 
-[Important] Requires the OASIS simulation environment to be running to use this feature!"""
+[Important] Requires the OASIS simulation environment of this run to be running. Interview answers
+are produced after the simulation ended; label them as post-simulation interviews, not as observed behaviour."""
 
 # ── Outline Planning Prompt ──
 
 PLAN_SYSTEM_PROMPT = """\
-You are an expert writer of "Future Prediction Reports", possessing a "God's-eye view" of the simulated world — you can observe the behavior, statements, and interactions of every Agent in the simulation.
+You are an analyst writing an evidence-based assessment report about ONE run of an agent-based
+social-media simulation (OASIS: simulated Twitter and Reddit populated by synthetic personas).
 
-[Core Concept]
-We built a simulated world and injected specific "simulation requirements" into it as variables. The evolution outcomes of the simulated world are predictions of what may happen in the future. What you are observing is not "experimental data", but a "preview of the future".
+[Evidence Model]
+- Primary evidence: the raw action logs of this run (what each simulated persona posted, commented,
+  liked, searched...). They are synthetic: they show how simulated personas behaved, not how real
+  customers behave.
+- Context: the assessment brief, the source/product documents and the simulation configuration.
+- Supplementary: a graph of facts extracted from the source documents.
+
+[Fixed Sections - already generated separately, do NOT plan them]
+- "Persona Analysis" (every requested persona individually, funnel fields, missing stages)
+- "Hypothesis Assessment" (each hypothesis of the brief with a verdict)
+- "Evidence Base & Methodology" (counts, sources, integrity)
 
 [Your Task]
-Write a "Future Prediction Report" that answers:
-1. Under the conditions we set, what happened in the future?
-2. How did various types of Agents (populations) react and act?
-3. What noteworthy future trends and risks does this simulation reveal?
+Plan 2 to 4 additional synthesis sections answering the assessment brief across personas, e.g.
+cross-persona patterns, frictions and objections, open questions, recommendations for real-world
+validation. Never plan sections that would need data the simulation does not contain.
 
-[Report Positioning]
-- ✅ This is a simulation-based future prediction report, revealing "if this happens, what will the future look like"
-- ✅ Focus on prediction results: event trajectories, group reactions, emergent phenomena, potential risks
-- ✅ The words and actions of Agents in the simulated world are predictions of future population behavior
-- ❌ Not an analysis of the current state of the real world
-- ❌ Not a generic public opinion overview
-
-[Section Count Limit]
-- Minimum 2 sections, maximum 5 sections
-- No subsections needed; write complete content directly for each section
-- Content should be concise, focused on core predictive findings
-- Section structure is designed autonomously by you based on prediction results
-
-Please output the report outline in JSON format, as follows:
+Output JSON:
 {
     "title": "Report Title",
-    "summary": "Report Summary (one sentence summarizing the core predictive finding)",
+    "summary": "One sentence summarizing the main simulated finding (label it as simulated)",
     "sections": [
-        {
-            "title": "Section Title",
-            "description": "Section Content Description"
-        }
+        {"title": "Section Title", "description": "Section Content Description"}
     ]
 }
 
-Note: The sections array must have a minimum of 2 and a maximum of 5 elements!"""
+Note: the sections array must contain 2 to 4 elements."""
 
 PLAN_USER_PROMPT_TEMPLATE = """\
-[Prediction Scenario Setting]
-The variable we injected into the simulated world (simulation requirement): {simulation_requirement}
+[Assessment Brief]
+{simulation_requirement}
 
-[Simulated World Scale]
-- Number of entities participating in the simulation: {total_nodes}
-- Number of relationships between entities: {total_edges}
-- Entity type distribution: {entity_types}
-- Number of active agents: {total_entities}
+[Simulation Evidence of This Run (simulation counts)]
+{evidence_stats_json}
 
-[Sample of Future Facts Predicted by the Simulation]
-{related_facts_json}
+[Data Integrity]
+{integrity_warnings}
 
-Please review this future preview from a "God's-eye view":
-1. Under the conditions we set, what state did the future present?
-2. How did various populations (Agents) react and act?
-3. What noteworthy future trends does this simulation reveal?
+[Sample of Simulated Actions]
+{action_sample}
 
-Based on the prediction results, design the most appropriate report section structure.
+[Supplementary: graph of source-document facts]
+- Entities: {total_nodes}, relationships: {total_edges}, entity types: {entity_types}
+- Sample facts: {related_facts_json}
 
-[Reminder] Report section count: minimum 2, maximum 5, content should be concise and focused on core predictive findings."""
+Plan the synthesis sections (2-4)."""
 
 # ── Section Generation Prompt ──
 
@@ -625,44 +665,41 @@ Current Section to Write: {section_title}
 [Core Concept]
 ═══════════════════════════════════════════════════════════════
 
-The simulated world is a preview of the future. We injected specific conditions (simulation requirements) into the simulated world,
-and the behavior and interactions of Agents in the simulation are predictions of future population behavior.
-
-Your tasks are:
-- Reveal what happened in the future under the set conditions
-- Predict how various populations (Agents) will react and act
-- Discover noteworthy future trends, risks, and opportunities
-
-❌ Do not write an analysis of the current state of the real world
-✅ Focus on "what will the future look like" — simulation results are the predicted future
+This report is about ONE run of an agent-based social-media simulation (simulated Twitter and
+Reddit, synthetic personas). The simulation shows how simulated personas behaved under the
+conditions of the assessment brief. It is not real-world customer data.
 
 ═══════════════════════════════════════════════════════════════
 [Most Important Rules - Must Be Followed]
 ═══════════════════════════════════════════════════════════════
 
-1. [Must Call Tools to Observe the Simulated World]
-   - You are observing a preview of the future from a "God's-eye view"
-   - All content must come from events and Agent statements that occurred in the simulated world
-   - Forbidden to use your own knowledge to write report content
-   - Each section must call tools at least 3 times (maximum 5 times) to observe the simulated world, which represents the future
+1. [Raw Simulation Actions Are the Primary Evidence]
+   - Use simulation_actions, persona_evidence and evidence_stats to observe what happened in this run
+   - Every statement about simulated behaviour must cite action references, e.g. [TW-00012] or [RD-00003]
+   - Graph tools (insight_forge, panorama_search, quick_search) return facts extracted from the
+     SOURCE DOCUMENTS; use them only as context and never present them as simulated behaviour
+   - Forbidden to use your own knowledge to fill gaps
 
-2. [Must Quote Agents' Original Statements and Actions]
-   - Agents' statements and actions are predictions of future population behavior
-   - Use quote format in the report to present these predictions, for example:
-     > "A certain group will state: original content..."
-   - These quotes are the core evidence of the simulation's predictions
+2. [Simulated Is Not Real-World]
+   - Write "in the simulation", "simulated persona C01 ...", never "customers will ..."
+   - Do NOT present percentages, conversion rates or market shares; mention counts only as
+     simulation counts (e.g. "3 of the 10 simulated personas")
 
-3. [Language Consistency - Quoted Content Must Be Translated to the Report Language]
-   - Content returned by tools may contain expressions in a different language from the report
-   - The report must be written entirely in the language consistent with the user-specified language
-   - When you quote content returned by tools in other languages, you must translate it into the report language before writing it
-   - Maintain the original meaning during translation and ensure natural and fluent expression
-   - This rule applies equally to body text and content within quote blocks (> format)
+3. [Missing Evidence Stays Missing]
+   - If the simulation does not show something, write explicitly that it was not observed
+   - Never fill gaps with assumptions; keep negative evidence (objections, distrust, abandonment)
 
-4. [Faithfully Present Prediction Results]
-   - Report content must reflect the simulation results in the simulated world that represent the future
-   - Do not add information that does not exist in the simulation
-   - If information is insufficient in some aspect, state so honestly
+4. [Quote Simulated Statements]
+   - Quote simulated posts/comments with their reference:
+     > "original content" [RD-00003]
+
+5. [Language Consistency - Quoted Content Must Be Translated to the Report Language]
+   - The report must be written entirely in the user-specified language
+   - Translate quoted tool content into the report language, keeping its meaning and the reference
+
+6. [Consistency With the Fixed Sections]
+   - The completed sections (Persona Analysis, Hypothesis Assessment) were validated against the raw
+     actions; do not contradict them
 
 ═══════════════════════════════════════════════════════════════
 [⚠️ Format Specifications - Extremely Important!]
@@ -677,20 +714,17 @@ Your tasks are:
 
 [Correct Example]
 ```
-This section analyzes the public opinion dissemination trend of the event. Through in-depth analysis of simulation data, we found...
+In the simulation, price was the most discussed friction point among the family personas...
 
-**Initial Outbreak Stage**
+**Price Objections**
 
-As the first scene of public opinion, Weibo undertook the core function of initial information release:
+Simulated persona C03 rejected the paid plan after comparing it with a free alternative:
 
-> "Weibo contributed 68% of the initial voice volume..."
+> "Why would I pay for this if the campsite app is free?" [RD-00041]
 
-**Emotion Amplification Stage**
+**Not Observed**
 
-The Douyin platform further amplified the event's impact:
-
-- Strong visual impact
-- High emotional resonance
+- No simulated persona reached a checkout step in this run
 ```
 
 [Wrong Example]
@@ -703,16 +737,16 @@ This section analyzes...
 ```
 
 ═══════════════════════════════════════════════════════════════
-[Available Retrieval Tools] (Call 3-5 times per section)
+[Available Tools] (Call 3-5 times per section)
 ═══════════════════════════════════════════════════════════════
 
 {tools_description}
 
-[Tool Usage Suggestions - Please Mix Different Tools, Do Not Use Only One]
-- insight_forge: Deep insight analysis, automatically decomposes questions and retrieves facts and relationships across multiple dimensions
-- panorama_search: Wide-angle panoramic search, understand the full picture, timeline, and evolution of events
-- quick_search: Quickly verify a specific information point
-- interview_agents: Interview simulation agents to obtain first-person views and real reactions from different roles
+[Tool Usage Suggestions]
+- Start with evidence_stats and simulation_actions / persona_evidence (primary evidence)
+- source_documents / simulation_config: context about the product and the simulation setup
+- insight_forge / panorama_search / quick_search: supplementary source-document facts
+- interview_agents: only if the run's environment is still running; label answers as post-simulation interviews
 
 ═══════════════════════════════════════════════════════════════
 [Workflow]
@@ -739,8 +773,8 @@ When you have obtained enough information through tools, output the section cont
 [Section Content Requirements]
 ═══════════════════════════════════════════════════════════════
 
-1. Content must be based on simulation data retrieved by tools
-2. Extensively quote original text to demonstrate simulation effects
+1. Content must be based on this run's simulated actions retrieved by tools, with action references
+2. Quote simulated statements with their references
 3. Use Markdown format (but headings are forbidden):
    - Use **bold text** to highlight key points (instead of subheadings)
    - Use lists (- or 1.2.3.) to organize points
@@ -776,9 +810,9 @@ Completed section content (please read carefully to avoid repetition):
 
 [Important Reminders]
 1. Carefully read the completed sections above to avoid repeating the same content!
-2. Must call tools to get simulation data before starting
-3. Please mix different tools, do not use only one
-4. Report content must come from retrieval results, do not use your own knowledge
+2. Must call tools to get this run's simulated actions before starting
+3. Cite action references for statements about simulated behaviour
+4. Report content must come from tool results; state explicitly what was not observed
 
 [⚠️ Format Warning - Must Be Followed]
 - ❌ Do not write any headings (#, ##, ###, #### are all not allowed)
@@ -827,10 +861,12 @@ REACT_FORCE_FINAL_MSG = "Tool call limit reached. Please output Final Answer: di
 # ── Chat prompt ──
 
 CHAT_SYSTEM_PROMPT_TEMPLATE = """\
-You are a concise and efficient simulation prediction assistant.
+You are a concise and efficient assistant for one simulation run's assessment report.
 
 [Background]
-Prediction conditions: {simulation_requirement}
+Assessment brief: {simulation_requirement}
+Evidence rules: simulated actions are synthetic, not real-world data; cite action references; say
+explicitly when something was not observed; no percentages or conversion rates.
 
 [Generated Analysis Report]
 {report_content}
@@ -889,16 +925,20 @@ class ReportAgent:
         simulation_requirement: str,
         llm_client: Optional[LLMClient] = None,
         graph_tools: Optional[GraphToolsService] = None,
+        run_id: Optional[str] = None,
+        evidence: Optional[RunEvidence] = None,
     ):
         """
         Initialize the Report Agent.
 
         Args:
-            graph_id: Graph ID.
+            graph_id: Graph ID (supplementary retrieval source).
             simulation_id: Simulation ID.
             simulation_requirement: Description of the simulation requirement.
             llm_client: LLM client (optional).
             graph_tools: Graph tools service (optional).
+            run_id: Run whose evidence the report is built from (default: current run).
+            evidence: Pre-loaded RunEvidence (optional, mainly for tests).
         """
         self.graph_id = graph_id
         self.simulation_id = simulation_id
@@ -906,6 +946,15 @@ class ReportAgent:
 
         self.llm = llm_client or LLMClient()
         self.graph_tools = graph_tools or GraphToolsService()
+
+        self.evidence: Optional[RunEvidence] = evidence
+        self._evidence_loaded = evidence is not None
+        self.evidence_error: Optional[str] = None
+        self.run_id = run_id or (evidence.run_id if evidence else None)
+        self.spec: Optional[AssessmentSpec] = None
+        self.structured: Optional[StructuredReportBuilder] = None
+        self.graph_stats = {"calls": 0, "hits": 0}
+        self.log = get_run_logger("mirofish.report_agent", simulation_id, self.run_id, "report")
 
         # Tool definitions
         self.tools = self._define_tools()
@@ -919,9 +968,56 @@ class ReportAgent:
             t("report.agentInitDone", graphId=graph_id, simulationId=simulation_id)
         )
 
+    def _ensure_evidence(self) -> Optional[RunEvidence]:
+        """Load the run's raw evidence once (None if the simulation has no run)"""
+        if not self._evidence_loaded:
+            self._evidence_loaded = True
+            try:
+                self.evidence = RunEvidence.load(self.simulation_id, self.run_id)
+                self.run_id = self.evidence.run_id
+                self.log = get_run_logger("mirofish.report_agent", self.simulation_id, self.run_id, "report")
+            except Exception as e:
+                self.evidence_error = str(e)
+                self.log.warning(f"No run evidence available: {e}")
+        return self.evidence
+
     def _define_tools(self) -> Dict[str, Dict[str, Any]]:
-        """Define the available tools."""
+        """Define the available tools (raw evidence first, graph as supplement)."""
         return {
+            "simulation_actions": {
+                "name": "simulation_actions",
+                "description": TOOL_DESC_SIMULATION_ACTIONS,
+                "parameters": {
+                    "query": "Keywords (optional)",
+                    "persona": "Canonical persona id or name (optional)",
+                    "platform": "twitter or reddit (optional)",
+                    "action_type": "e.g. CREATE_POST (optional)",
+                    "limit": "Max results (optional, default 40)",
+                },
+            },
+            "persona_evidence": {
+                "name": "persona_evidence",
+                "description": TOOL_DESC_PERSONA_EVIDENCE,
+                "parameters": {"persona": "Canonical persona id (e.g. C01) or name"},
+            },
+            "evidence_stats": {
+                "name": "evidence_stats",
+                "description": TOOL_DESC_EVIDENCE_STATS,
+                "parameters": {},
+            },
+            "source_documents": {
+                "name": "source_documents",
+                "description": TOOL_DESC_SOURCE_DOCUMENTS,
+                "parameters": {
+                    "name": "Part of a filename (optional)",
+                    "query": "Keywords (optional)",
+                },
+            },
+            "simulation_config": {
+                "name": "simulation_config",
+                "description": TOOL_DESC_SIMULATION_CONFIG,
+                "parameters": {},
+            },
             "insight_forge": {
                 "name": "insight_forge",
                 "description": TOOL_DESC_INSIGHT_FORGE,
@@ -970,9 +1066,19 @@ class ReportAgent:
         Returns:
             Tool execution result (text format).
         """
-        logger.info(t("report.executingTool", toolName=tool_name, params=parameters))
+        self.log.info(t("report.executingTool", toolName=tool_name, params=parameters))
 
         try:
+            if tool_name in self.EVIDENCE_TOOL_NAMES:
+                return self._execute_evidence_tool(tool_name, parameters or {})
+
+            if tool_name in ("insight_forge", "panorama_search", "quick_search"):
+                result_text = self._execute_graph_tool(tool_name, parameters or {}, report_context)
+                return (
+                    "[Supplementary graph retrieval: facts extracted from the source documents, "
+                    "NOT simulated behaviour]\n" + result_text
+                )
+
             if tool_name == "insight_forge":
                 query = parameters.get("query", "")
                 ctx = parameters.get("report_context", "") or report_context
@@ -1064,8 +1170,146 @@ class ReportAgent:
             logger.error(t("report.toolExecFailed", toolName=tool_name, error=str(e)))
             return f"Tool execution failed: {str(e)}"
 
+    def _execute_graph_tool(
+        self, tool_name: str, parameters: Dict[str, Any], report_context: str = ""
+    ) -> str:
+        """Run a supplementary graph tool and count its retrieval results"""
+        query = parameters.get("query", "")
+        self.graph_stats["calls"] += 1
+        if tool_name == "insight_forge":
+            ctx = parameters.get("report_context", "") or report_context
+            result = self.graph_tools.insight_forge(
+                graph_id=self.graph_id,
+                query=query,
+                simulation_requirement=self.simulation_requirement,
+                report_context=ctx,
+            )
+            hits = getattr(result, "total_facts", 0) or 0
+        elif tool_name == "panorama_search":
+            include_expired = parameters.get("include_expired", True)
+            if isinstance(include_expired, str):
+                include_expired = include_expired.lower() in ["true", "1", "yes"]
+            result = self.graph_tools.panorama_search(
+                graph_id=self.graph_id, query=query, include_expired=include_expired
+            )
+            hits = len(getattr(result, "active_facts", []) or [])
+        else:
+            limit = parameters.get("limit", 10)
+            if isinstance(limit, str):
+                limit = int(limit)
+            result = self.graph_tools.quick_search(
+                graph_id=self.graph_id, query=query, limit=limit
+            )
+            hits = getattr(result, "total_count", 0) or 0
+        self.graph_stats["hits"] += hits
+        self.log.info(f"Graph retrieval {tool_name}: {hits} results (query={query[:80]!r})")
+        return result.to_text()
+
+    def _execute_evidence_tool(self, tool_name: str, parameters: Dict[str, Any]) -> str:
+        """Tools reading the run's raw evidence directly (no graph involved)"""
+        evidence = self._ensure_evidence()
+        if evidence is None:
+            return (
+                "No simulation run evidence is available for this report "
+                f"({self.evidence_error or 'no run found'}). State that simulated behaviour cannot be assessed."
+            )
+
+        if tool_name == "simulation_actions":
+            limit = parameters.get("limit", 40)
+            try:
+                limit = max(1, min(int(limit), 200))
+            except (TypeError, ValueError):
+                limit = 40
+            actions = evidence.search_actions(
+                query=parameters.get("query"),
+                persona=parameters.get("persona"),
+                platform=parameters.get("platform"),
+                action_type=parameters.get("action_type"),
+                limit=0,
+            )
+            header = (
+                f"Run {evidence.run_id}: {len(actions)} matching simulated actions "
+                f"(showing {min(len(actions), limit)})."
+            )
+            if not actions and parameters.get("query"):
+                # Keyword search is literal; never let a vocabulary mismatch look like
+                # "no events": fall back to every action matching the other filters
+                actions = evidence.search_actions(
+                    persona=parameters.get("persona"),
+                    platform=parameters.get("platform"),
+                    action_type=parameters.get("action_type"),
+                    limit=0,
+                )
+                header = (
+                    f"Run {evidence.run_id}: no action contains the keywords {parameters.get('query')!r}. "
+                    f"Showing all {len(actions)} actions matching the other filters "
+                    f"(first {min(len(actions), limit)}); read them before concluding anything is unobserved."
+                )
+            if not actions:
+                return header + " This run contains no simulated action for these filters: NOT OBSERVED."
+            return header + "\n" + "\n".join(RunEvidence.format_action(a) for a in actions[:limit])
+
+        if tool_name == "persona_evidence":
+            cid = evidence.resolve_persona(parameters.get("persona") or parameters.get("query"))
+            persona = evidence.persona_index.personas.get(cid) if cid else None
+            if persona is None:
+                return (
+                    f"Persona {parameters.get('persona')!r} is not present among the simulated agents. "
+                    f"Known personas: {', '.join(sorted(evidence.persona_index.personas))}"
+                )
+            actions = evidence.persona_actions(cid)
+            profile = persona["profiles"][0] if persona.get("profiles") else {}
+            lines = [
+                f"Persona {cid} — {persona['display_name']} (agent ids {persona['agent_ids']}, names {persona['names']})",
+                f"Definition: {json.dumps({k: v for k, v in profile.items() if k in ('entity_type', 'bio', 'persona', 'profession', 'stance')}, ensure_ascii=False)[:1500]}",
+                f"Simulated actions: {len(actions)}",
+            ]
+            lines.append(evidence.persona_transcript(cid, max_chars=12000) if actions else "NO simulated actions: nothing was observed for this persona.")
+            return "\n".join(lines)
+
+        if tool_name == "evidence_stats":
+            return json.dumps(
+                {
+                    "run_id": evidence.run_id,
+                    "stats": evidence.stats(),
+                    "requested_persona_ids": evidence.requested_ids,
+                    "personas": evidence.persona_index.to_list(),
+                    "integrity_warnings": evidence.integrity.get("warnings", []),
+                    "note": "Simulation counts of synthetic agents, not real-world rates.",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )[:12000]
+
+        if tool_name == "source_documents":
+            return evidence.source_excerpts(
+                name=parameters.get("name"), query=parameters.get("query"), max_chars=6000
+            )
+
+        if tool_name == "simulation_config":
+            cfg = evidence.config or {}
+            summary = {
+                "time_config": cfg.get("time_config"),
+                "event_config": cfg.get("event_config"),
+                "agents": [
+                    {"agent_id": a.get("agent_id"), "entity_name": a.get("entity_name"), "entity_type": a.get("entity_type"), "stance": a.get("stance")}
+                    for a in cfg.get("agent_configs", [])
+                ],
+            }
+            return json.dumps(summary, ensure_ascii=False, indent=2)[:10000]
+
+        return f"{t('api.unknownTool', name=tool_name)}"
+
+    EVIDENCE_TOOL_NAMES = {
+        "simulation_actions",
+        "persona_evidence",
+        "evidence_stats",
+        "source_documents",
+        "simulation_config",
+    }
+
     # Set of valid tool names for bare JSON fallback parsing validation
-    VALID_TOOL_NAMES = {
+    VALID_TOOL_NAMES = EVIDENCE_TOOL_NAMES | {
         "insight_forge",
         "panorama_search",
         "quick_search",
@@ -1083,11 +1327,17 @@ class ReportAgent:
         tool_calls = []
 
         # Format 1: XML style (standard format)
-        xml_pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
+        # The prompts instruct <tool>...</tool>; <tool_call> is accepted for compatibility
+        xml_pattern = r"<(tool_call|tool)>\s*(\{.*?\})\s*</\1>"
         for match in re.finditer(xml_pattern, response, re.DOTALL):
             try:
-                call_data = json.loads(match.group(1))
-                tool_calls.append(call_data)
+                call_data = json.loads(match.group(2))
+                if "tool" in call_data and "name" not in call_data:
+                    call_data["name"] = call_data.pop("tool")
+                if "params" in call_data and "parameters" not in call_data:
+                    call_data["parameters"] = call_data.pop("params")
+                if call_data.get("name"):
+                    tool_calls.append(call_data)
             except json.JSONDecodeError:
                 pass
 
@@ -1197,23 +1447,45 @@ class ReportAgent:
         if progress_callback:
             progress_callback("planning", 0, t("progress.analyzingRequirements"))
 
-        # First get simulation context
-        context = self.graph_tools.get_simulation_context(
-            graph_id=self.graph_id, simulation_requirement=self.simulation_requirement
-        )
+        # Supplementary graph context (facts from the source documents)
+        try:
+            context = self.graph_tools.get_simulation_context(
+                graph_id=self.graph_id, simulation_requirement=self.simulation_requirement
+            )
+        except Exception as e:
+            self.log.warning(f"Graph context unavailable: {e}")
+            context = {}
+        self.graph_stats["calls"] += 1
+        self.graph_stats["hits"] += len(context.get("related_facts", []) or [])
 
         if progress_callback:
             progress_callback("planning", 30, t("progress.generatingOutline"))
 
+        # Primary evidence: the run's raw actions
+        evidence = self._ensure_evidence()
+        if evidence is not None:
+            evidence_stats = evidence.stats()
+            integrity = "\n".join(evidence.integrity.get("warnings", [])) or "No integrity warnings."
+            sample = "\n".join(
+                RunEvidence.format_action(a, max_chars=300) for a in evidence.actions[:20]
+            ) or "(no simulated actions in this run)"
+        else:
+            evidence_stats = {"error": self.evidence_error or "no run evidence"}
+            integrity = "No run evidence available."
+            sample = "(no simulated actions available)"
+
+        brief = evidence.brief_text if evidence is not None and evidence.brief_text else self.simulation_requirement
         system_prompt = f"{PLAN_SYSTEM_PROMPT}\n\n{get_language_instruction()}"
         user_prompt = PLAN_USER_PROMPT_TEMPLATE.format(
-            simulation_requirement=self.simulation_requirement,
+            simulation_requirement=brief[:6000],
+            evidence_stats_json=json.dumps(evidence_stats, ensure_ascii=False, indent=2)[:4000],
+            integrity_warnings=integrity,
+            action_sample=sample,
             total_nodes=context.get("graph_statistics", {}).get("total_nodes", 0),
             total_edges=context.get("graph_statistics", {}).get("total_edges", 0),
             entity_types=list(
                 context.get("graph_statistics", {}).get("entity_types", {}).keys()
             ),
-            total_entities=context.get("total_entities", 0),
             related_facts_json=json.dumps(
                 context.get("related_facts", [])[:10], ensure_ascii=False, indent=2
             ),
@@ -1231,12 +1503,12 @@ class ReportAgent:
             if progress_callback:
                 progress_callback("planning", 80, t("progress.parsingOutline"))
 
-            # Parse outline
+            # Parse outline (fixed evidence sections are added by generate_report)
             sections = []
-            for section_data in response.get("sections", []):
-                sections.append(
-                    ReportSection(title=section_data.get("title", ""), content="")
-                )
+            for section_data in response.get("sections", [])[:4]:
+                title = (section_data.get("title") or "").strip()
+                if title and title not in STRUCTURED_SECTION_TITLES:
+                    sections.append(ReportSection(title=title, content=""))
 
             outline = ReportOutline(
                 title=response.get("title", t("api.defaultReportTitle")),
@@ -1254,12 +1526,11 @@ class ReportAgent:
             logger.error(t("report.outlinePlanFailed", error=str(e)))
             # Return default outline (3 sections, as fallback)
             return ReportOutline(
-                title="Future Prediction Report",
-                summary="Analysis of Future Trends and Risks Based on Simulation Predictions",
+                title="Simulation Assessment Report",
+                summary="Assessment of simulated persona behaviour (synthetic evidence, not real-world data)",
                 sections=[
-                    ReportSection(title="Prediction Scenario and Core Findings"),
-                    ReportSection(title="Population Behavior Prediction Analysis"),
-                    ReportSection(title="Trend Outlook and Risk Warnings"),
+                    ReportSection(title="Cross-Persona Findings"),
+                    ReportSection(title="Open Questions and Real-World Validation"),
                 ],
             )
 
@@ -1334,10 +1605,11 @@ class ReportAgent:
         conflict_retries = 0  # Consecutive conflict count (tool call + Final Answer both present)
         used_tools = set()  # Track called tool names
         all_tools = {
+            "simulation_actions",
+            "persona_evidence",
+            "evidence_stats",
+            "source_documents",
             "insight_forge",
-            "panorama_search",
-            "quick_search",
-            "interview_agents",
         }
 
         # Report context, used for InsightForge sub-query generation
@@ -1428,9 +1700,9 @@ class ReportAgent:
                             conflictCount=conflict_retries,
                         )
                     )
-                    first_tool_end = response.find("</tool_call>")
-                    if first_tool_end != -1:
-                        response = response[: first_tool_end + len("</tool_call>")]
+                    end_match = re.search(r"</tool(?:_call)?>", response)
+                    if end_match:
+                        response = response[: end_match.end()]
                         tool_calls = self._parse_tool_calls(response)
                         has_tool_calls = bool(tool_calls)
                     has_final_answer = False
@@ -1667,6 +1939,9 @@ class ReportAgent:
             report_id = f"report_{uuid.uuid4().hex[:12]}"
         start_time = datetime.now()
 
+        # Load the run's raw evidence before anything else: it is the primary source
+        evidence = self._ensure_evidence()
+
         report = Report(
             report_id=report_id,
             simulation_id=self.simulation_id,
@@ -1674,7 +1949,9 @@ class ReportAgent:
             simulation_requirement=self.simulation_requirement,
             status=ReportStatus.PENDING,
             created_at=datetime.now().isoformat(),
+            run_id=self.run_id,
         )
+        self.log.info(f"Report generation started: {report_id}")
 
         # Completed section titles list (for progress tracking)
         completed_section_titles = []
@@ -1693,6 +1970,34 @@ class ReportAgent:
 
             # Initialize console logger (console_log.txt)
             self.console_logger = ReportConsoleLogger(report_id)
+
+            # Assessment spec: which personas / hypotheses / funnel fields the brief asks for
+            brief = evidence.brief_text if evidence is not None else self.simulation_requirement
+            families = set()
+            if evidence is not None:
+                for agent in evidence.agents:
+                    parsed = parse_identifier(agent.get("name"))
+                    if parsed:
+                        families.add(parsed[0].upper())
+            self.spec = extract_assessment_spec(brief, self.llm, families)
+            if evidence is not None:
+                evidence.set_requested_ids(self.spec.persona_ids)
+                for name in getattr(evidence, "brief_documents", []) or []:
+                    evidence.mark_source_used(name)
+            self.log.info(
+                f"Assessment spec: personas={self.spec.persona_ids or 'all'} "
+                f"hypotheses={[h['id'] for h in self.spec.hypotheses]} "
+                f"funnel_fields={len(self.spec.funnel_fields)} ({self.spec.funnel_fields_source})"
+            )
+            if evidence is not None:
+                counts = evidence.platform_counts()
+                self.log.info(
+                    f"Action evidence loaded: twitter={counts.get('twitter', 0)} "
+                    f"reddit={counts.get('reddit', 0)}; source files loaded: {len(evidence.sources)}"
+                )
+            self.structured = StructuredReportBuilder(
+                evidence, self.spec, self.llm, get_language_instruction(), self.log
+            )
 
             ReportManager.update_progress(
                 report_id, "pending", 0, t("progress.initReport"), completed_sections=[]
@@ -1721,6 +2026,13 @@ class ReportAgent:
                     if progress_callback
                     else None
                 )
+            )
+            # Fixed evidence sections: persona and hypothesis analysis first (the
+            # synthesis sections build on them), evidence appendix last
+            outline.sections = (
+                [ReportSection(title=PERSONA_SECTION_TITLE), ReportSection(title=HYPOTHESIS_SECTION_TITLE)]
+                + outline.sections
+                + [ReportSection(title=APPENDIX_SECTION_TITLE)]
             )
             report.outline = outline
 
@@ -1778,22 +2090,28 @@ class ReportAgent:
                     )
 
                 # Generate main section content
-                section_content = self._generate_section_react(
-                    section=section,
-                    outline=outline,
-                    previous_sections=generated_sections,
-                    progress_callback=lambda stage, prog, msg: (
-                        progress_callback(
-                            stage, base_progress + int(prog * 0.7 / total_sections), msg
-                        )
-                        if progress_callback
-                        else None
-                    ),
-                    section_index=section_num,
-                )
+                if section.title in STRUCTURED_SECTION_TITLES:
+                    section_content, context_summary = self._generate_structured_section(
+                        section, section_num
+                    )
+                else:
+                    section_content = self._generate_section_react(
+                        section=section,
+                        outline=outline,
+                        previous_sections=generated_sections,
+                        progress_callback=lambda stage, prog, msg: (
+                            progress_callback(
+                                stage, base_progress + int(prog * 0.7 / total_sections), msg
+                            )
+                            if progress_callback
+                            else None
+                        ),
+                        section_index=section_num,
+                    )
+                    context_summary = section_content
 
                 section.content = section_content
-                generated_sections.append(f"## {section.title}\n\n{section_content}")
+                generated_sections.append(f"## {section.title}\n\n{context_summary}")
 
                 # Save section
                 ReportManager.save_section(report_id, section_num, section)
@@ -1846,8 +2164,16 @@ class ReportAgent:
             report.status = ReportStatus.COMPLETED
             report.completed_at = datetime.now().isoformat()
 
+            # Machine-readable evidence and results next to the Markdown report
+            self._save_machine_readable(report_id, report)
+
             # Calculate total elapsed time
             total_time_seconds = (datetime.now() - start_time).total_seconds()
+            self.log.info(
+                f"Report completed: {report_id} sections={total_sections} "
+                f"graph_calls={self.graph_stats['calls']} graph_hits={self.graph_stats['hits']} "
+                f"time={total_time_seconds:.0f}s"
+            )
 
             # Log report completion
             if self.report_logger:
@@ -1878,7 +2204,7 @@ class ReportAgent:
             return report
 
         except Exception as e:
-            logger.error(t("report.reportGenFailed", error=str(e)))
+            self.log.error(t("report.reportGenFailed", error=str(e)))
             report.status = ReportStatus.FAILED
             report.error = str(e)
 
@@ -1905,6 +2231,78 @@ class ReportAgent:
                 self.console_logger = None
 
             return report
+
+    def _generate_structured_section(self, section: ReportSection, section_index: int):
+        """
+        Generate one of the fixed evidence sections
+
+        Returns:
+            (section markdown, compact summary passed as context to later sections)
+        """
+        if self.report_logger:
+            self.report_logger.log_section_start(section.title, section_index)
+        builder = self.structured
+        if section.title == PERSONA_SECTION_TITLE:
+            builder.analyse_personas()
+            content = builder.render_personas()
+            summary = json.dumps(
+                [
+                    {
+                        "persona": r["canonical_id"],
+                        "actions": r["action_counts"].get("total", 0),
+                        "observed": [f["field"] for f in r["fields"] if f["status"] == "observed"],
+                        "missing": r["missing_stages"],
+                        "for": r["strongest_evidence_for"]["summary"][:200],
+                        "against": r["strongest_evidence_against"]["summary"][:200],
+                    }
+                    for r in builder.persona_results
+                ],
+                ensure_ascii=False,
+            )[:6000]
+        elif section.title == HYPOTHESIS_SECTION_TITLE:
+            builder.assess_hypotheses()
+            content = builder.render_hypotheses()
+            summary = content[:3000]
+        else:
+            content = builder.render_appendix(self.graph_stats)
+            summary = "(evidence appendix)"
+        if self.report_logger:
+            self.report_logger.log_section_content(
+                section_title=section.title,
+                section_index=section_index,
+                content=content,
+                tool_calls_count=0,
+            )
+        return content, summary
+
+    def _save_machine_readable(self, report_id: str, report: Report) -> None:
+        """Write evidence.json (normalized evidence) and report.json (structured results)"""
+        folder = ReportManager._ensure_report_folder(report_id)
+        evidence = self.evidence
+        evidence_data = evidence.to_dict() if evidence is not None else {"error": self.evidence_error}
+        evidence_data["graph_retrieval"] = dict(self.graph_stats)
+        with open(os.path.join(folder, "evidence.json"), "w", encoding="utf-8") as f:
+            json.dump(evidence_data, f, ensure_ascii=False, indent=2)
+        structured = self.structured.to_dict() if self.structured else {}
+        report_json = {
+            "report_id": report_id,
+            "simulation_id": self.simulation_id,
+            "run_id": self.run_id,
+            "title": report.outline.title if report.outline else None,
+            "summary": report.outline.summary if report.outline else None,
+            "evidence_type": "simulated (synthetic agents); not real-world customer data",
+            "assessment_spec": structured.get("assessment_spec"),
+            "personas": structured.get("personas", []),
+            "hypotheses": structured.get("hypotheses", []),
+            "evidence_stats": evidence.stats() if evidence is not None else None,
+            "integrity_warnings": evidence.integrity.get("warnings", []) if evidence is not None else [],
+            "sources": evidence.source_manifest() if evidence is not None else [],
+            "graph_retrieval": dict(self.graph_stats),
+            "sections": [s.title for s in report.outline.sections] if report.outline else [],
+            "generated_at": datetime.now().isoformat(),
+        }
+        with open(os.path.join(folder, "report.json"), "w", encoding="utf-8") as f:
+            json.dump(report_json, f, ensure_ascii=False, indent=2)
 
     def chat(
         self, message: str, chat_history: List[Dict[str, str]] = None
@@ -1933,7 +2331,7 @@ class ReportAgent:
         # Get generated report content
         report_content = ""
         try:
-            report = ReportManager.get_report_by_simulation(self.simulation_id)
+            report = ReportManager.get_report_by_simulation(self.simulation_id, self.run_id) or ReportManager.get_report_by_simulation(self.simulation_id)
             if report and report.markdown_content:
                 # Limit report length to avoid excessive context
                 report_content = report.markdown_content[:15000]
@@ -1974,7 +2372,7 @@ class ReportAgent:
             if not tool_calls:
                 # No tool calls, return response directly
                 clean_response = re.sub(
-                    r"<tool_call>.*?</tool_call>", "", response, flags=re.DOTALL
+                    r"<(tool_call|tool)>.*?</\1>", "", response, flags=re.DOTALL
                 )
                 clean_response = re.sub(r"\[TOOL_CALL\].*?\)", "", clean_response)
 
@@ -2015,7 +2413,7 @@ class ReportAgent:
 
         # Clean response
         clean_response = re.sub(
-            r"<tool_call>.*?</tool_call>", "", final_response, flags=re.DOTALL
+            r"<(tool_call|tool)>.*?</\1>", "", final_response, flags=re.DOTALL
         )
         clean_response = re.sub(r"\[TOOL_CALL\].*?\)", "", clean_response)
 
@@ -2643,28 +3041,24 @@ class ReportManager:
             created_at=data.get("created_at", ""),
             completed_at=data.get("completed_at", ""),
             error=data.get("error"),
+            run_id=data.get("run_id"),
         )
 
     @classmethod
-    def get_report_by_simulation(cls, simulation_id: str) -> Optional[Report]:
-        """Return the report for the given simulation ID."""
-        cls._ensure_reports_dir()
+    def get_report_by_simulation(
+        cls, simulation_id: str, run_id: Optional[str] = None
+    ) -> Optional[Report]:
+        """
+        Return the newest report of a simulation (optionally of one run)
 
-        for item in os.listdir(cls.REPORTS_DIR):
-            item_path = os.path.join(cls.REPORTS_DIR, item)
-            # New format: folder
-            if os.path.isdir(item_path):
-                report = cls.get_report(item)
-                if report and report.simulation_id == simulation_id:
-                    return report
-            # Backward compat: JSON file
-            elif item.endswith(".json"):
-                report_id = item[:-5]
-                report = cls.get_report(report_id)
-                if report and report.simulation_id == simulation_id:
-                    return report
-
-        return None
+        Args:
+            simulation_id: Simulation ID
+            run_id: Only consider reports generated from this run
+        """
+        reports = cls.list_reports(simulation_id=simulation_id, limit=10000)
+        if run_id:
+            reports = [r for r in reports if r.run_id == run_id]
+        return reports[0] if reports else None
 
     @classmethod
     def list_reports(

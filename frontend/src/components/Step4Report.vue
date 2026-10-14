@@ -136,6 +136,11 @@
             </svg>
           </button>
 
+          <!-- Auditable export of the run evidence + report -->
+          <a v-if="isComplete && reportId" class="download-bundle-btn" :href="exportUrl" download>
+            {{ $t('step4.downloadRunBundle') }}
+          </a>
+
           <div class="workflow-divider"></div>
         </div>
 
@@ -393,7 +398,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, h, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { getAgentLog, getConsoleLog } from '../api/report'
+import { getAgentLog, getConsoleLog, getReportExportUrl } from '../api/report'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -407,6 +412,8 @@ const props = defineProps({
 const emit = defineEmits(['add-log', 'update-status'])
 
 // Navigation
+const exportUrl = computed(() => (props.reportId ? getReportExportUrl(props.reportId) : ''))
+
 const goToInteraction = () => {
   if (props.reportId) {
     router.push({ name: 'Interaction', params: { reportId: props.reportId } })
@@ -1882,6 +1889,16 @@ const renderMarkdown = (content) => {
   
   // Process inline code
   html = html.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
+
+  // Process tables (evidence sections use Markdown tables)
+  html = html.replace(/(^\|.*\|[ \t]*\n?)+/gm, (block) => {
+    const rows = block.trim().split('\n').filter(r => r.trim())
+    if (rows.length < 2 || !/^\|[\s:|-]+\|$/.test(rows[1].trim())) return block
+    const splitRow = (row) => row.trim().replace(/^\||\|$/g, '').split(/(?<!\\)\|/).map(c => c.trim().replace(/\\\|/g, '|'))
+    const head = splitRow(rows[0]).map(c => `<th>${c}</th>`).join('')
+    const body = rows.slice(2).map(r => `<tr>${splitRow(r).map(c => `<td>${c}</td>`).join('')}</tr>`).join('')
+    return `<div class="md-table-wrap"><table class="md-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>\n`
+  })
   
   // Process headings
   html = html.replace(/^#### (.+)$/gm, '<h5 class="md-h5">$1</h5>')
@@ -1935,8 +1952,8 @@ const renderMarkdown = (content) => {
   html = html.replace(/<p class="md-p"><\/p>/g, '')
   html = html.replace(/<p class="md-p">(<h[2-5])/g, '$1')
   html = html.replace(/(<\/h[2-5]>)<\/p>/g, '$1')
-  html = html.replace(/<p class="md-p">(<ul|<ol|<blockquote|<pre|<hr)/g, '$1')
-  html = html.replace(/(<\/ul>|<\/ol>|<\/blockquote>|<\/pre>)<\/p>/g, '$1')
+  html = html.replace(/<p class="md-p">(<ul|<ol|<blockquote|<pre|<hr|<div class="md-table-wrap")/g, '$1')
+  html = html.replace(/(<\/ul>|<\/ol>|<\/blockquote>|<\/pre>|<\/table><\/div>)<\/p>/g, '$1')
   // Clean <br> tags around block-level elements
   html = html.replace(/<br>\s*(<ul|<ol|<blockquote)/g, '$1')
   html = html.replace(/(<\/ul>|<\/ol>|<\/blockquote>)\s*<br>/g, '$1')
@@ -3430,6 +3447,51 @@ watch(() => props.reportId, (newId) => {
 
 .next-step-btn:hover svg {
   transform: translateX(4px);
+}
+
+:deep(.md-table-wrap) {
+  overflow-x: auto;
+  margin: 8px 0 12px 0;
+}
+
+:deep(.md-table) {
+  border-collapse: collapse;
+  font-size: 12px;
+  width: 100%;
+}
+
+:deep(.md-table th),
+:deep(.md-table td) {
+  border: 1px solid #E5E7EB;
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+:deep(.md-table th) {
+  background: #F9FAFB;
+  font-weight: 600;
+}
+
+.download-bundle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(100% - 40px);
+  margin: 8px 20px 0 20px;
+  padding: 10px 20px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #1F2937;
+  background: #FFFFFF;
+  border: 1px solid #1F2937;
+  border-radius: 8px;
+  text-decoration: none;
+  box-sizing: border-box;
+}
+
+.download-bundle-btn:hover {
+  background: #F3F4F6;
 }
 
 /* Workflow Empty */

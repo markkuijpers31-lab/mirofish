@@ -168,28 +168,70 @@ def generate_ontology():
         # Create project
         project = ProjectManager.create_project(name=project_name)
         project.simulation_requirement = simulation_requirement
+        project.additional_context = additional_context or None
         logger.info(f"Created project: {project.project_id}")
 
-        # Save files and extract text
+        # Save files and extract text. Each document keeps its original file,
+        # its own extracted text and its extraction status so reports can prove
+        # which sources were available.
         document_texts = []
         all_text = ""
 
         for file in uploaded_files:
-            if file and file.filename and allowed_file(file.filename):
-                # Save file to project directory
-                file_info = ProjectManager.save_file_to_project(
-                    project.project_id, file, file.filename
-                )
+            if not (file and file.filename):
+                continue
+            if not allowed_file(file.filename):
+                logger.warning(f"Skipped unsupported file type: {file.filename}")
                 project.files.append(
                     {
-                        "filename": file_info["original_filename"],
-                        "size": file_info["size"],
+                        "filename": file.filename,
+                        "size": None,
+                        "extraction_status": "unsupported",
+                        "error": "Unsupported file type",
                     }
                 )
+                continue
 
-                # Extract text
+            # Save file to project directory
+            file_info = ProjectManager.save_file_to_project(
+                project.project_id, file, file.filename
+            )
+            entry = {
+                "filename": file_info["original_filename"],
+                "saved_filename": file_info["saved_filename"],
+                "extension": os.path.splitext(file_info["original_filename"])[1].lower(),
+                "size": file_info["size"],
+            }
+
+            # Extract text; a single unreadable file must not drop the others
+            try:
                 text = FileParser.extract_text(file_info["path"])
                 text = TextProcessor.preprocess_text(text)
+                entry["extraction_status"] = "ok" if text.strip() else "empty"
+                if not text.strip():
+                    entry["error"] = "No extractable text (scanned PDF or empty file?)"
+            except Exception as extract_error:
+                logger.error(
+                    f"Text extraction failed: {file_info['original_filename']}: {extract_error}"
+                )
+                text = ""
+                entry["extraction_status"] = "failed"
+                entry["error"] = str(extract_error)
+
+            entry["text_length"] = len(text)
+            entry["text_file"] = ProjectManager.save_source_text(
+                project.project_id,
+                len(project.files) + 1,
+                file_info["original_filename"],
+                text,
+            )
+            project.files.append(entry)
+            logger.info(
+                f"Source document stored: {entry['filename']} "
+                f"status={entry['extraction_status']} chars={len(text)}"
+            )
+
+            if text.strip():
                 document_texts.append(text)
                 all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
 
@@ -202,14 +244,29 @@ def generate_ontology():
         ProjectManager.save_extracted_text(project.project_id, all_text)
         logger.info(f"Text extraction complete, total {len(all_text)} characters")
 
-        # Generate ontology
+        # Generate ontology. On failure the project is kept (sources stay
+        # auditable) but marked FAILED, so it can never be used to build a graph.
         logger.info("Calling LLM to generate ontology definition...")
-        generator = OntologyGenerator()
-        ontology = generator.generate(
-            document_texts=document_texts,
-            simulation_requirement=simulation_requirement,
-            additional_context=additional_context if additional_context else None,
-        )
+        try:
+            generator = OntologyGenerator()
+            ontology = generator.generate(
+                document_texts=document_texts,
+                simulation_requirement=simulation_requirement,
+                additional_context=additional_context if additional_context else None,
+            )
+        except Exception as ontology_error:
+            logger.error(f"Ontology generation failed for {project.project_id}: {ontology_error}")
+            project.status = ProjectStatus.FAILED
+            project.error = f"Ontology generation failed: {ontology_error}"
+            ProjectManager.save_project(project)
+            return jsonify(
+                {
+                    "success": False,
+                    "error": project.error,
+                    "project_id": project.project_id,
+                    "traceback": traceback.format_exc(),
+                }
+            ), 500
 
         # Save ontology to project
         entity_count = len(ontology.get("entity_types", []))
@@ -421,12 +478,23 @@ def build_graph():
                     )
 
                 extractor.extract_and_store(chunks, extract_progress)
+                build_logger.info(f"[{task_id}] Extraction stats: {extractor.stats}")
 
                 # Get graph data
                 task_manager.update_task(
                     task_id, message=t("progress.fetchingGraphData"), progress=95
                 )
                 graph_data = builder.get_graph_data(graph_id)
+
+                # An empty graph cannot produce personas: fail clearly instead of
+                # reporting success and failing later in simulation preparation
+                if graph_data.get("node_count", 0) == 0:
+                    raise ValueError(
+                        "No entities could be extracted from the source documents "
+                        f"({extractor.stats['chunks_failed']}/{extractor.stats['chunks_total']} "
+                        "chunks failed in the LLM extraction step). Check the LLM settings "
+                        "and the extracted text of the uploaded files."
+                    )
 
                 # Update project status
                 project.status = ProjectStatus.GRAPH_COMPLETED
