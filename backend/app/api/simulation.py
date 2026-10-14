@@ -5,7 +5,7 @@ Step2: Entity reading and filtering, OASIS simulation preparation and execution 
 
 import os
 import traceback
-from typing import Optional
+from typing import Any, Dict, Optional
 from flask import request, jsonify, send_file
 
 from . import simulation_bp
@@ -14,7 +14,8 @@ from ..services.entity_reader import EntityReader
 from ..services.oasis_profile_generator import OasisProfileGenerator
 from ..services.simulation_manager import SimulationManager, SimulationStatus
 from ..services.simulation_runner import SimulationRunner, RunnerStatus
-from ..utils.logger import get_logger
+from ..services.run_store import RunStatus, RunStore
+from ..utils.logger import get_logger, get_run_logger
 from ..utils.locale import t, get_locale, set_locale
 from ..models.project import ProjectManager
 
@@ -281,6 +282,7 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
             "ready",
             "preparing",
             "running",
+            "paused",
             "completed",
             "stopped",
             "failed",
@@ -933,8 +935,15 @@ def get_simulation_history():
                 sim_dict["total_simulation_hours"] = 0
                 recommended_rounds = 0
 
-            # Get run state (read user-set actual rounds from run_state.json)
-            run_state = SimulationRunner.get_run_state(sim.simulation_id)
+            # Get run state of the current run (read user-set actual rounds from run_state.json)
+            current_run = RunStore.get_current_run(sim.simulation_id)
+            sim_dict["run_id"] = current_run.run_id if current_run else None
+            sim_dict["run_status"] = current_run.status.value if current_run else "not_started"
+            run_state = (
+                SimulationRunner.get_run_state(sim.simulation_id, current_run.run_id)
+                if current_run
+                else None
+            )
             if run_state:
                 sim_dict["current_round"] = run_state.current_round
                 sim_dict["runner_status"] = run_state.runner_status.value
@@ -1439,41 +1448,43 @@ def generate_profiles():
 @simulation_bp.route("/start", methods=["POST"])
 def start_simulation():
     """
-    Start running the simulation
+    Start a simulation run (idempotent)
+
+    Every execution is a separate run with its own immutable directory
+    (uploads/simulations/<simulation_id>/runs/<run_id>/). A plain start never
+    replaces or deletes an existing run.
 
     Request (JSON):
         {
             "simulation_id": "sim_xxxx",          // required, simulation ID
             "platform": "parallel",                // optional: twitter / reddit / parallel (default)
-            "max_rounds": 100,                     // optional: max simulation rounds, used to truncate overly long simulations
-            "enable_graph_memory_update": false,   // optional: whether to dynamically update Agent activity into the graph store memory
-            "force": false                         // optional: force restart (will stop the running simulation and clean up logs)
+            "max_rounds": 100,                     // optional: max simulation rounds
+            "enable_graph_memory_update": false,   // optional: kept for compatibility (not applied)
+            "new_run": false,                      // optional: explicit restart -> create a NEW run, keep the old one
+            "force": false                         // deprecated and ignored: never deletes or restarts anything
         }
 
-    About the force parameter:
-        - When enabled, if the simulation is running or has completed, it will first stop and clean up the run logs
-        - Cleaned-up contents include: run_state.json, actions.jsonl, simulation.log, etc.
-        - Configuration files (simulation_config.json) and profile files will not be cleaned up
-        - Suitable for scenarios where the simulation needs to be rerun
-
-    About enable_graph_memory_update:
-        - When enabled, all Agent activities during the simulation (posting, commenting, liking, etc.) are updated to the graph store in real time
-        - This lets the graph "remember" the simulation process for subsequent analysis or AI conversations
-        - Requires the simulation's associated project to have a valid graph_id
-        - Uses a batch update mechanism to reduce the number of API calls
+    Behaviour:
+        - no run yet                    -> create run, start it            (started=true)
+        - current run running           -> nothing happens                 (started=false, already_running=true)
+        - current run finished          -> nothing happens                 (started=false, run_exists=true)
+        - new_run=true                  -> stop the old run if it is still active (evidence kept),
+                                           create a new run and start it   (started=true)
 
     Returns:
         {
             "success": true,
             "data": {
                 "simulation_id": "sim_xxxx",
+                "run_id": "run_20250101120000_ab12cd",
+                "run_status": "running",
+                "started": true,
+                "already_running": false,
+                "run_exists": false,
+                "previous_run_id": null,
                 "runner_status": "running",
                 "process_pid": 12345,
-                "twitter_running": true,
-                "reddit_running": true,
-                "started_at": "2025-12-01T10:00:00",
-                "graph_memory_update_enabled": true,  // whether graph memory update is enabled
-                "force_restarted": true               // whether this is a forced restart
+                ...
             }
         }
     """
@@ -1488,10 +1499,9 @@ def start_simulation():
 
         platform = data.get("platform", "parallel")
         max_rounds = data.get("max_rounds")  # Optional: max simulation rounds
-        enable_graph_memory_update = data.get(
-            "enable_graph_memory_update", False
-        )  # Optional: whether to enable graph memory update
-        force = data.get("force", False)  # Optional: force restart
+        enable_graph_memory_update = bool(data.get("enable_graph_memory_update", False))
+        new_run = data.get("new_run", False) is True
+        force = data.get("force", False)
 
         # Validate max_rounds parameter
         if max_rounds is not None:
@@ -1511,67 +1521,52 @@ def start_simulation():
                 {"success": False, "error": t("api.invalidPlatform", platform=platform)}
             ), 400
 
-        # Check if simulation is ready
-        manager = SimulationManager()
-        state = manager.get_simulation(simulation_id)
+        if force:
+            logger.warning(
+                f"[{simulation_id}] Deprecated 'force' flag ignored: runs are never deleted; "
+                f"use new_run=true for an explicit restart"
+            )
 
-        if not state:
-            return jsonify(
-                {
-                    "success": False,
-                    "error": t("api.simulationNotFound", id=simulation_id),
-                }
-            ), 404
+        with RunStore.lock(simulation_id):
+            manager = SimulationManager()
+            state = manager.get_simulation(simulation_id)
 
-        force_restarted = False
+            if not state:
+                return jsonify(
+                    {
+                        "success": False,
+                        "error": t("api.simulationNotFound", id=simulation_id),
+                    }
+                ), 404
 
-        # Smart state handling: if preparation is complete, allow restart
-        if state.status != SimulationStatus.READY:
-            # Check if preparation is complete
-            is_prepared, prepare_info = _check_simulation_prepared(simulation_id)
+            current = SimulationRunner.reconcile_run(
+                simulation_id, RunStore.get_current_run(simulation_id)
+            )
 
-            if is_prepared:
-                # Preparation complete, check if there's a running process
-                if state.status == SimulationStatus.RUNNING:
-                    # Check if simulation process is actually running
-                    run_state = SimulationRunner.get_run_state(simulation_id)
-                    if run_state and run_state.runner_status.value == "running":
-                        # Process is indeed running
-                        if force:
-                            # Force mode: stop running simulation
-                            logger.info(f"Force mode: stopping running simulation {simulation_id}")
-                            try:
-                                SimulationRunner.stop_simulation(simulation_id)
-                            except Exception as e:
-                                logger.warning(f"Warning while stopping simulation: {str(e)}")
-                        else:
-                            return jsonify(
-                                {
-                                    "success": False,
-                                    "error": t("api.simRunningForceHint"),
-                                }
-                            ), 400
-
-                # If force mode, clean up run logs
-                if force:
-                    logger.info(f"Force mode: cleaning simulation logs {simulation_id}")
-                    cleanup_result = SimulationRunner.cleanup_simulation_logs(
-                        simulation_id
+            # Idempotent start: an existing execution is reported, never replaced
+            if current is not None and not new_run:
+                if current.status == RunStatus.RUNNING or (
+                    current.status == RunStatus.NOT_STARTED
+                    and SimulationRunner.is_process_alive(simulation_id)
+                ):
+                    get_run_logger("mirofish.api.simulation", simulation_id, current.run_id).info(
+                        "Start requested while run is active: attaching (no new run)"
                     )
-                    if not cleanup_result.get("success"):
-                        logger.warning(
-                            f"Warning while cleaning logs: {cleanup_result.get('errors')}"
-                        )
-                    force_restarted = True
+                    return jsonify({"success": True, "data": _start_response(
+                        simulation_id, current.run_id, started=False, already_running=True
+                    )})
+                if current.status != RunStatus.NOT_STARTED:
+                    get_run_logger("mirofish.api.simulation", simulation_id, current.run_id).info(
+                        f"Start requested for existing run with status {current.status.value}: "
+                        f"nothing started (use explicit restart for a new run)"
+                    )
+                    return jsonify({"success": True, "data": _start_response(
+                        simulation_id, current.run_id, started=False, run_exists=True
+                    )})
 
-                # Process doesn't exist or has ended, reset status to ready
-                logger.info(
-                    f"Simulation {simulation_id} preparation complete, resetting status to ready (was: {state.status.value})"
-                )
-                state.status = SimulationStatus.READY
-                manager._save_simulation_state(state)
-            else:
-                # Preparation not complete
+            # A new execution requires a prepared simulation
+            is_prepared, prepare_info = _check_simulation_prepared(simulation_id)
+            if not is_prepared:
                 return jsonify(
                     {
                         "success": False,
@@ -1579,47 +1574,56 @@ def start_simulation():
                     }
                 ), 400
 
-        # Get graph ID (for graph memory update)
-        graph_id = None
-        if enable_graph_memory_update:
-            # Get graph_id from simulation state or project
+            previous_run_id = None
+            if current is not None and new_run:
+                previous_run_id = current.run_id
+                prev_log = get_run_logger("mirofish.api.simulation", simulation_id, current.run_id)
+                if current.status == RunStatus.RUNNING:
+                    prev_log.info("Explicit restart: stopping active run (its evidence is kept)")
+                    try:
+                        SimulationRunner.stop_simulation(simulation_id, current.run_id)
+                    except Exception as e:
+                        prev_log.warning(f"Stop before restart: {e}")
+                # A finished run may still have its process alive for interviews
+                SimulationRunner.terminate_run_process(simulation_id)
+
+            if SimulationRunner.is_process_alive(simulation_id):
+                return jsonify(
+                    {"success": False, "error": t("api.simRunningForceHint")}
+                ), 409
+
+            # Reuse a never-started run (e.g. its process failed to launch) only when
+            # it holds no evidence; otherwise create a fresh run directory
+            if current is not None and not new_run and current.status == RunStatus.NOT_STARTED and not current.legacy:
+                run_id = current.run_id
+            else:
+                run_id = RunStore.create_run(
+                    simulation_id, platform, max_rounds, previous_run_id=previous_run_id
+                ).run_id
+
             graph_id = state.graph_id
             if not graph_id:
-                # Try getting from project
                 project = ProjectManager.get_project(state.project_id)
                 if project:
                     graph_id = project.graph_id
 
-            if not graph_id:
-                return jsonify(
-                    {"success": False, "error": t("api.graphIdRequiredForMemory")}
-                ), 400
-
-            logger.info(
-                f"Graph memory update enabled: simulation_id={simulation_id}, graph_id={graph_id}"
+            run_state = SimulationRunner.start_simulation(
+                simulation_id=simulation_id,
+                platform=platform,
+                max_rounds=max_rounds,
+                enable_graph_memory_update=enable_graph_memory_update,
+                graph_id=graph_id,
+                run_id=run_id,
             )
 
-        # Start simulation
-        run_state = SimulationRunner.start_simulation(
-            simulation_id=simulation_id,
-            platform=platform,
-            max_rounds=max_rounds,
-            enable_graph_memory_update=enable_graph_memory_update,
-            graph_id=graph_id,
-        )
+            # Update simulation state
+            state.status = SimulationStatus.RUNNING
+            manager._save_simulation_state(state)
 
-        # Update simulation state
-        state.status = SimulationStatus.RUNNING
-        manager._save_simulation_state(state)
-
-        response_data = run_state.to_dict()
+        response_data = _start_response(simulation_id, run_id, started=True, run_state=run_state)
+        response_data["previous_run_id"] = previous_run_id
         if max_rounds:
             response_data["max_rounds_applied"] = max_rounds
-        response_data["graph_memory_update_enabled"] = enable_graph_memory_update
-        response_data["force_restarted"] = force_restarted
-        if enable_graph_memory_update:
-            response_data["graph_id"] = graph_id
-
         return jsonify({"success": True, "data": response_data})
 
     except ValueError as e:
@@ -1627,6 +1631,114 @@ def start_simulation():
 
     except Exception as e:
         logger.error(f"Failed to start simulation: {str(e)}")
+        return jsonify(
+            {"success": False, "error": str(e), "traceback": traceback.format_exc()}
+        ), 500
+
+
+def _run_info(simulation_id: str, run_id: Optional[str] = None) -> Dict[str, Any]:
+    """Lifecycle info of a run (default: current run) for API responses"""
+    record = RunStore.get_run(simulation_id, run_id) if run_id else RunStore.get_current_run(simulation_id)
+    record = SimulationRunner.reconcile_run(simulation_id, record)
+    runs = RunStore.list_runs(simulation_id)
+    if record is None:
+        return {
+            "run_id": None,
+            "run_status": RunStatus.NOT_STARTED.value,
+            "runs_count": len(runs),
+            "legacy_run": False,
+        }
+    return {
+        "run_id": record.run_id,
+        "run_status": record.status.value,
+        "runs_count": len(runs),
+        "legacy_run": record.legacy,
+        "run_created_at": record.created_at,
+        "run_completed_at": record.completed_at,
+        "latest_report_id": record.latest_report_id,
+        "report_ids": record.report_ids,
+        "run_error": record.error,
+    }
+
+
+def _start_response(
+    simulation_id: str,
+    run_id: str,
+    started: bool,
+    already_running: bool = False,
+    run_exists: bool = False,
+    run_state: Any = None,
+) -> Dict[str, Any]:
+    run_state = run_state or SimulationRunner.get_run_state(simulation_id, run_id)
+    data = run_state.to_dict() if run_state else {"simulation_id": simulation_id, "runner_status": "idle"}
+    data.update(_run_info(simulation_id, run_id))
+    data.update({
+        "started": started,
+        "already_running": already_running,
+        "run_exists": run_exists,
+        # Kept for older frontends: a start never clears earlier logs anymore
+        "force_restarted": False,
+        "graph_memory_update_enabled": False,
+    })
+    return data
+
+
+@simulation_bp.route("/<simulation_id>/runs/<run_id>/export", methods=["GET"])
+def export_run_bundle(simulation_id: str, run_id: str):
+    """
+    Download the evidence bundle (ZIP) of one run, without a report
+
+    Query parameters:
+        report_id: optional report of this run to include
+
+    Returns:
+        application/zip attachment
+    """
+    try:
+        import io
+        from ..services.run_export import build_run_bundle
+
+        data, filename = build_run_bundle(
+            simulation_id, run_id, report_id=request.args.get("report_id")
+        )
+        return send_file(
+            io.BytesIO(data),
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=filename,
+        )
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    except Exception as e:
+        return jsonify(
+            {"success": False, "error": str(e), "traceback": traceback.format_exc()}
+        ), 500
+
+
+@simulation_bp.route("/<simulation_id>/runs", methods=["GET"])
+def list_simulation_runs(simulation_id: str):
+    """
+    List all runs (executions) of a simulation, oldest first
+
+    Returns:
+        {
+            "success": true,
+            "data": {"current_run_id": "run_...", "runs": [RunRecord...]},
+            "count": 2
+        }
+    """
+    try:
+        runs = RunStore.list_runs(simulation_id)
+        runs = [SimulationRunner.reconcile_run(simulation_id, r) for r in runs]
+        return jsonify({
+            "success": True,
+            "data": {
+                "current_run_id": runs[-1].run_id if runs else None,
+                "runs": [r.to_dict() for r in runs],
+            },
+            "count": len(runs),
+        })
+    except Exception as e:
         return jsonify(
             {"success": False, "error": str(e), "traceback": traceback.format_exc()}
         ), 500
@@ -1661,16 +1773,20 @@ def stop_simulation():
                 {"success": False, "error": t("api.requireSimulationId")}
             ), 400
 
-        run_state = SimulationRunner.stop_simulation(simulation_id)
+        with RunStore.lock(simulation_id):
+            run_state = SimulationRunner.stop_simulation(simulation_id, data.get("run_id"))
 
-        # Update simulation state
-        manager = SimulationManager()
-        state = manager.get_simulation(simulation_id)
-        if state:
-            state.status = SimulationStatus.PAUSED
-            manager._save_simulation_state(state)
+            # Update simulation state (stopped runs keep their evidence; the
+            # simulation stays prepared so a new run can be started explicitly)
+            manager = SimulationManager()
+            state = manager.get_simulation(simulation_id)
+            if state:
+                state.status = SimulationStatus.STOPPED
+                manager._save_simulation_state(state)
 
-        return jsonify({"success": True, "data": run_state.to_dict()})
+        result = run_state.to_dict()
+        result.update(_run_info(simulation_id, run_state.run_id))
+        return jsonify({"success": True, "data": result})
 
     except ValueError as e:
         return jsonify({"success": False, "error": str(e)}), 400
@@ -1688,7 +1804,14 @@ def stop_simulation():
 @simulation_bp.route("/<simulation_id>/run-status", methods=["GET"])
 def get_run_status(simulation_id: str):
     """
-    Get the real-time running status of the simulation (for frontend polling)
+    Get the real-time running status of a run (for frontend polling)
+
+    Query parameters:
+        run_id: Run ID (optional, default: current run)
+
+    The response always includes the persistent lifecycle fields
+    run_id / run_status (not_started|running|completed|failed|stopped|reporting|report_completed)
+    / runs_count, so a reloaded page can show the real backend state.
 
     Returns:
         {
@@ -1712,26 +1835,31 @@ def get_run_status(simulation_id: str):
         }
     """
     try:
-        run_state = SimulationRunner.get_run_state(simulation_id)
+        run_id = request.args.get("run_id")
+        info = _run_info(simulation_id, run_id)
+        run_state = (
+            SimulationRunner.get_run_state(simulation_id, info["run_id"])
+            if info["run_id"]
+            else None
+        )
 
         if not run_state:
-            return jsonify(
-                {
-                    "success": True,
-                    "data": {
-                        "simulation_id": simulation_id,
-                        "runner_status": "idle",
-                        "current_round": 0,
-                        "total_rounds": 0,
-                        "progress_percent": 0,
-                        "twitter_actions_count": 0,
-                        "reddit_actions_count": 0,
-                        "total_actions_count": 0,
-                    },
-                }
-            )
+            data = {
+                "simulation_id": simulation_id,
+                "runner_status": "idle",
+                "current_round": 0,
+                "total_rounds": 0,
+                "progress_percent": 0,
+                "twitter_actions_count": 0,
+                "reddit_actions_count": 0,
+                "total_actions_count": 0,
+            }
+            data.update(info)
+            return jsonify({"success": True, "data": data})
 
-        return jsonify({"success": True, "data": run_state.to_dict()})
+        data = run_state.to_dict()
+        data.update(info)
+        return jsonify({"success": True, "data": data})
 
     except Exception as e:
         logger.error(f"Failed to get run state: {str(e)}")
@@ -1778,32 +1906,31 @@ def get_run_status_detail(simulation_id: str):
         }
     """
     try:
-        run_state = SimulationRunner.get_run_state(simulation_id)
+        info = _run_info(simulation_id, request.args.get("run_id"))
+        run_id = info["run_id"]
+        run_state = SimulationRunner.get_run_state(simulation_id, run_id) if run_id else None
         platform_filter = request.args.get("platform")
 
         if not run_state:
-            return jsonify(
-                {
-                    "success": True,
-                    "data": {
-                        "simulation_id": simulation_id,
-                        "runner_status": "idle",
-                        "all_actions": [],
-                        "twitter_actions": [],
-                        "reddit_actions": [],
-                    },
-                }
-            )
+            data = {
+                "simulation_id": simulation_id,
+                "runner_status": "idle",
+                "all_actions": [],
+                "twitter_actions": [],
+                "reddit_actions": [],
+            }
+            data.update(info)
+            return jsonify({"success": True, "data": data})
 
         # Get full action list
         all_actions = SimulationRunner.get_all_actions(
-            simulation_id=simulation_id, platform=platform_filter
+            simulation_id=simulation_id, platform=platform_filter, run_id=run_id
         )
 
         # Get actions by platform
         twitter_actions = (
             SimulationRunner.get_all_actions(
-                simulation_id=simulation_id, platform="twitter"
+                simulation_id=simulation_id, platform="twitter", run_id=run_id
             )
             if not platform_filter or platform_filter == "twitter"
             else []
@@ -1811,7 +1938,7 @@ def get_run_status_detail(simulation_id: str):
 
         reddit_actions = (
             SimulationRunner.get_all_actions(
-                simulation_id=simulation_id, platform="reddit"
+                simulation_id=simulation_id, platform="reddit", run_id=run_id
             )
             if not platform_filter or platform_filter == "reddit"
             else []
@@ -1824,6 +1951,7 @@ def get_run_status_detail(simulation_id: str):
                 simulation_id=simulation_id,
                 platform=platform_filter,
                 round_num=current_round,
+                run_id=run_id,
             )
             if current_round > 0
             else []
@@ -1831,6 +1959,7 @@ def get_run_status_detail(simulation_id: str):
 
         # Get basic status info
         result = run_state.to_dict()
+        result.update(info)
         result["all_actions"] = [a.to_dict() for a in all_actions]
         result["twitter_actions"] = [a.to_dict() for a in twitter_actions]
         result["reddit_actions"] = [a.to_dict() for a in reddit_actions]
@@ -1874,6 +2003,7 @@ def get_simulation_actions(simulation_id: str):
         platform = request.args.get("platform")
         agent_id = request.args.get("agent_id", type=int)
         round_num = request.args.get("round_num", type=int)
+        run_id = request.args.get("run_id")
 
         actions = SimulationRunner.get_actions(
             simulation_id=simulation_id,
@@ -1882,6 +2012,7 @@ def get_simulation_actions(simulation_id: str):
             platform=platform,
             agent_id=agent_id,
             round_num=round_num,
+            run_id=run_id,
         )
 
         return jsonify(
@@ -1919,7 +2050,10 @@ def get_simulation_timeline(simulation_id: str):
         end_round = request.args.get("end_round", type=int)
 
         timeline = SimulationRunner.get_timeline(
-            simulation_id=simulation_id, start_round=start_round, end_round=end_round
+            simulation_id=simulation_id,
+            start_round=start_round,
+            end_round=end_round,
+            run_id=request.args.get("run_id"),
         )
 
         return jsonify(
@@ -1944,7 +2078,7 @@ def get_agent_stats(simulation_id: str):
     Used for the frontend to display Agent activity rankings, action distributions, etc.
     """
     try:
-        stats = SimulationRunner.get_agent_stats(simulation_id)
+        stats = SimulationRunner.get_agent_stats(simulation_id, request.args.get("run_id"))
 
         return jsonify(
             {"success": True, "data": {"agents_count": len(stats), "stats": stats}}
@@ -1977,9 +2111,7 @@ def get_simulation_posts(simulation_id: str):
         limit = request.args.get("limit", 50, type=int)
         offset = request.args.get("offset", 0, type=int)
 
-        sim_dir = os.path.join(
-            os.path.dirname(__file__), f"../../uploads/simulations/{simulation_id}"
-        )
+        sim_dir = RunStore.get_run_dir(simulation_id, request.args.get("run_id"))
 
         db_file = f"{platform}_simulation.db"
         db_path = os.path.join(sim_dir, db_file)
@@ -2058,9 +2190,7 @@ def get_simulation_comments(simulation_id: str):
         limit = request.args.get("limit", 50, type=int)
         offset = request.args.get("offset", 0, type=int)
 
-        sim_dir = os.path.join(
-            os.path.dirname(__file__), f"../../uploads/simulations/{simulation_id}"
-        )
+        sim_dir = RunStore.get_run_dir(simulation_id, request.args.get("run_id"))
 
         db_path = os.path.join(sim_dir, "reddit_simulation.db")
 

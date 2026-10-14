@@ -18,6 +18,19 @@ import logging
 from datetime import datetime
 from typing import Dict, Any, Optional
 
+# Execution identity, injected by the backend runner. Every log line carries the
+# run id so a log file can always be checked for evidence of another execution.
+RUN_ID = os.environ.get("MIROFISH_RUN_ID")
+SIMULATION_ID = os.environ.get("MIROFISH_SIMULATION_ID")
+
+
+def _write_entry(log_path: str, entry: Dict[str, Any]):
+    """Append one JSON line, tagged with the run id"""
+    if RUN_ID:
+        entry["run_id"] = RUN_ID
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
 
 class PlatformActionLogger:
     """Single-platform action logger"""
@@ -62,8 +75,7 @@ class PlatformActionLogger:
             "success": success,
         }
 
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _write_entry(self.log_path, entry)
 
     def log_round_start(self, round_num: int, simulated_hour: int):
         """Log round start"""
@@ -74,8 +86,7 @@ class PlatformActionLogger:
             "simulated_hour": simulated_hour,
         }
 
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _write_entry(self.log_path, entry)
 
     def log_round_end(self, round_num: int, actions_count: int):
         """Log round end"""
@@ -86,8 +97,7 @@ class PlatformActionLogger:
             "actions_count": actions_count,
         }
 
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _write_entry(self.log_path, entry)
 
     def log_simulation_start(self, config: Dict[str, Any]):
         """Log simulation start"""
@@ -102,8 +112,7 @@ class PlatformActionLogger:
             "agents_count": len(config.get("agent_configs", [])),
         }
 
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _write_entry(self.log_path, entry)
 
     def log_simulation_end(self, total_rounds: int, total_actions: int):
         """Log simulation end"""
@@ -115,8 +124,7 @@ class PlatformActionLogger:
             "total_actions": total_actions,
         }
 
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _write_entry(self.log_path, entry)
 
 
 class SimulationLogManager:
@@ -151,12 +159,15 @@ class SimulationLogManager:
         self._main_logger.setLevel(logging.INFO)
         self._main_logger.handlers.clear()
 
-        # File handler
-        file_handler = logging.FileHandler(log_path, encoding="utf-8", mode="w")
+        # File handler. Append: the runner already redirects the process output
+        # into the same file, and every run has its own directory.
+        prefix = f"[{SIMULATION_ID or 'sim_?'}][{RUN_ID or 'run_?'}] " if RUN_ID else ""
+        file_handler = logging.FileHandler(log_path, encoding="utf-8", mode="a")
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(
             logging.Formatter(
-                "%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+                f"%(asctime)s - %(levelname)s - {prefix}%(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
             )
         )
         self._main_logger.addHandler(file_handler)
@@ -242,8 +253,7 @@ class ActionLogger:
             "success": success,
         }
 
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _write_entry(self.log_path, entry)
 
     def log_round_start(self, round_num: int, simulated_hour: int, platform: str):
         entry = {
@@ -254,8 +264,7 @@ class ActionLogger:
             "simulated_hour": simulated_hour,
         }
 
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _write_entry(self.log_path, entry)
 
     def log_round_end(self, round_num: int, actions_count: int, platform: str):
         entry = {
@@ -266,8 +275,7 @@ class ActionLogger:
             "actions_count": actions_count,
         }
 
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _write_entry(self.log_path, entry)
 
     def log_simulation_start(self, platform: str, config: Dict[str, Any]):
         entry = {
@@ -281,8 +289,7 @@ class ActionLogger:
             "agents_count": len(config.get("agent_configs", [])),
         }
 
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _write_entry(self.log_path, entry)
 
     def log_simulation_end(self, platform: str, total_rounds: int, total_actions: int):
         entry = {
@@ -293,8 +300,7 @@ class ActionLogger:
             "total_actions": total_actions,
         }
 
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _write_entry(self.log_path, entry)
 
 
 # Global logger instance (legacy interface compatible)

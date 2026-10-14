@@ -91,6 +91,21 @@ Click the image to watch MiroFish's deep prediction of the lost ending based on 
 4. **Report Generation**: ReportAgent with rich toolset for deep interaction with post-simulation environment
 5. **Deep Interaction**: Chat with any agent in the simulated world & Interact with ReportAgent
 
+## 🧾 Runs, Evidence & Audit Export
+
+- Every simulation execution is a separate, immutable **run** stored under
+  `backend/uploads/simulations/<simulation_id>/runs/<run_id>/` (config snapshot, personas,
+  source documents, assessment brief, Twitter/Reddit action logs, simulation log).
+- Opening, reloading or navigating to Step 3 never starts or restarts a simulation. A new
+  run is only created by the explicit **Restart simulation (new run)** button; earlier runs
+  are kept unchanged.
+- Reports are generated from the raw action logs of one run (the local graph is only a
+  supplementary source) and can be regenerated without re-running the simulation.
+- After a report is finished, **Download run bundle (ZIP)** exports run metadata, config,
+  sources, brief, personas, raw action logs, normalized evidence, the report (Markdown +
+  JSON) and report-agent logs. Everything lives under `backend/uploads`, which is the
+  persistent volume in Docker.
+
 ## 🚀 Quick Start
 
 ### Option 1: Source Code Deployment (Recommended)

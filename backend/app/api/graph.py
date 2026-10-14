@@ -168,28 +168,70 @@ def generate_ontology():
         # Create project
         project = ProjectManager.create_project(name=project_name)
         project.simulation_requirement = simulation_requirement
+        project.additional_context = additional_context or None
         logger.info(f"Created project: {project.project_id}")
 
-        # Save files and extract text
+        # Save files and extract text. Each document keeps its original file,
+        # its own extracted text and its extraction status so reports can prove
+        # which sources were available.
         document_texts = []
         all_text = ""
 
         for file in uploaded_files:
-            if file and file.filename and allowed_file(file.filename):
-                # Save file to project directory
-                file_info = ProjectManager.save_file_to_project(
-                    project.project_id, file, file.filename
-                )
+            if not (file and file.filename):
+                continue
+            if not allowed_file(file.filename):
+                logger.warning(f"Skipped unsupported file type: {file.filename}")
                 project.files.append(
                     {
-                        "filename": file_info["original_filename"],
-                        "size": file_info["size"],
+                        "filename": file.filename,
+                        "size": None,
+                        "extraction_status": "unsupported",
+                        "error": "Unsupported file type",
                     }
                 )
+                continue
 
-                # Extract text
+            # Save file to project directory
+            file_info = ProjectManager.save_file_to_project(
+                project.project_id, file, file.filename
+            )
+            entry = {
+                "filename": file_info["original_filename"],
+                "saved_filename": file_info["saved_filename"],
+                "extension": os.path.splitext(file_info["original_filename"])[1].lower(),
+                "size": file_info["size"],
+            }
+
+            # Extract text; a single unreadable file must not drop the others
+            try:
                 text = FileParser.extract_text(file_info["path"])
                 text = TextProcessor.preprocess_text(text)
+                entry["extraction_status"] = "ok" if text.strip() else "empty"
+                if not text.strip():
+                    entry["error"] = "No extractable text (scanned PDF or empty file?)"
+            except Exception as extract_error:
+                logger.error(
+                    f"Text extraction failed: {file_info['original_filename']}: {extract_error}"
+                )
+                text = ""
+                entry["extraction_status"] = "failed"
+                entry["error"] = str(extract_error)
+
+            entry["text_length"] = len(text)
+            entry["text_file"] = ProjectManager.save_source_text(
+                project.project_id,
+                len(project.files) + 1,
+                file_info["original_filename"],
+                text,
+            )
+            project.files.append(entry)
+            logger.info(
+                f"Source document stored: {entry['filename']} "
+                f"status={entry['extraction_status']} chars={len(text)}"
+            )
+
+            if text.strip():
                 document_texts.append(text)
                 all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
 

@@ -5,6 +5,7 @@ Stores nodes, edges, episodes, and embeddings per graph.
 
 import os
 import json
+import re
 import sqlite3
 import uuid
 from typing import Dict, Any, List, Optional
@@ -337,13 +338,40 @@ class LocalGraphStore:
             return [self._row_to_node(r) for r in rows]
 
     def search_edges(self, query: str, limit: int = 20) -> List[LocalEdge]:
-        pattern = f"%{query}%"
+        """
+        Keyword search over edge facts
+
+        A natural-language query rarely occurs verbatim in a fact, so the query is
+        split into terms (3+ chars, common stopwords dropped); edges matching any
+        term are ranked by the number of matching terms.
+        """
+        terms = _query_terms(query)
+        if not terms:
+            pattern = f"%{query}%"
+            with _connect(self.graph_id) as conn:
+                rows = conn.execute(
+                    "SELECT * FROM edges WHERE graph_id=? AND (fact LIKE ? OR name LIKE ?) LIMIT ?",
+                    (self.graph_id, pattern, pattern, limit),
+                ).fetchall()
+                return [self._row_to_edge(r) for r in rows]
+
+        clause = " OR ".join(["fact LIKE ? OR name LIKE ?"] * len(terms))
+        params: List[Any] = [self.graph_id]
+        for term in terms:
+            params += [f"%{term}%", f"%{term}%"]
         with _connect(self.graph_id) as conn:
             rows = conn.execute(
-                "SELECT * FROM edges WHERE graph_id=? AND (fact LIKE ? OR name LIKE ?) LIMIT ?",
-                (self.graph_id, pattern, pattern, limit),
+                f"SELECT * FROM edges WHERE graph_id=? AND ({clause}) LIMIT 2000",
+                params,
             ).fetchall()
-            return [self._row_to_edge(r) for r in rows]
+        edges = [self._row_to_edge(r) for r in rows]
+
+        def score(edge: LocalEdge) -> int:
+            text = f"{edge.fact} {edge.name}".lower()
+            return sum(1 for term in terms if term in text)
+
+        edges.sort(key=score, reverse=True)
+        return edges[:limit]
 
     def get_statistics(self) -> Dict[str, Any]:
         with _connect(self.graph_id) as conn:
@@ -424,3 +452,20 @@ class LocalGraphStore:
 def delete_graph(graph_id: str):
     store = LocalGraphStore(graph_id)
     store.delete()
+
+
+_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "what", "how", "why", "who", "are", "was",
+    "were", "from", "into", "about", "does", "did", "have", "has", "will", "would", "their",
+    "they", "them", "which", "when", "where", "there", "been", "between", "over", "under",
+    "een", "het", "van", "voor", "met", "die", "dat", "wat", "hoe", "zijn", "wordt", "niet",
+}
+
+
+def _query_terms(query: str) -> List[str]:
+    """Search terms of a free-text query (lower-case, 3+ chars, no stopwords)"""
+    terms = []
+    for term in re.findall(r"\w+", (query or "").lower()):
+        if len(term) >= 3 and term not in _STOPWORDS and term not in terms:
+            terms.append(term)
+    return terms[:12]

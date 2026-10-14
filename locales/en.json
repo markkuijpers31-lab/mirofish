@@ -186,7 +186,6 @@
     "startingDualSim": "Starting dual-platform parallel simulation...",
     "graphMemoryUpdateEnabled": "Dynamic graph memory update enabled",
     "setMaxRounds": "Max simulation rounds set to: {rounds}",
-    "oldSimCleared": "Old simulation logs cleared, restarting simulation",
     "engineStarted": "Simulation engine started successfully",
     "startFailed": "Start failed: {error}",
     "startException": "Start error: {error}",
@@ -207,7 +206,10 @@
     "forceStopSuccess": "Simulation force stopped",
     "forceStopFailed": "Force stop failed: {error}",
     "startGenerateReportBtn": "Generate Report",
-    "generatingReportBtn": "Starting..."
+    "generatingReportBtn": "Starting...",
+    "startSimulationBtn": "Start simulation",
+    "restartSimulationBtn": "Restart simulation (new run)",
+    "restartConfirm": "Start a NEW simulation run?\n\nThe current run ({runId}) and all its evidence and reports are kept unchanged. The new run incurs new simulation costs."
   },
   "step4": {
     "generatingSection": "Generating {title}...",
@@ -249,7 +251,9 @@
     "panelRelatedEdges": "Related Edges",
     "panelRelatedNodes": "Related Nodes",
     "world1": "World 1",
-    "world2": "World 2"
+    "world2": "World 2",
+    "downloadRunBundle": "Download run bundle (ZIP)",
+    "runEvidenceNote": "Run {runId} · simulated evidence"
   },
   "step5": {
     "interactiveTools": "Interactive Tools",
@@ -585,7 +589,6 @@
     "startingDualSim": "Starting dual-platform parallel simulation...",
     "setMaxRounds": "Max simulation rounds set to: {rounds}",
     "graphMemoryUpdateEnabled": "Dynamic graph memory update enabled",
-    "oldSimCleared": "✓ Old simulation logs cleared, restarting simulation",
     "engineStarted": "✓ Simulation engine started successfully",
     "startFailed": "✗ Start failed: {error}",
     "startException": "✗ Start error: {error}",
@@ -622,7 +625,14 @@
     "getReportInfoFailed": "Failed to get report info: {error}",
     "enterStep": "Entering Step {step}: {name}",
     "returnToStep": "Returning to Step {step}: {name}",
-    "customSimRounds": "Custom simulation rounds: {rounds} rounds"
+    "customSimRounds": "Custom simulation rounds: {rounds} rounds",
+    "restartingAsNewRun": "Explicit restart: creating a NEW run (previous run is kept)...",
+    "attachedToRunningRun": "Run {runId} is already running, showing its progress (no new run started)",
+    "existingRunLoaded": "Existing run {runId} loaded (status: {status}); nothing was restarted",
+    "runCreated": "New run created: {runId}",
+    "previousRunKept": "Previous run kept unchanged: {runId}",
+    "noRunYet": "No run yet for this simulation. Click \"Start simulation\" to start one.",
+    "existingRunDetected": "Existing run {runId} (status: {status}) is kept; returning to setup does not stop or delete it"
   },
   "report": {
     "taskStarted": "Report generation task started",

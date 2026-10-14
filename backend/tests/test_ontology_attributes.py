@@ -6,10 +6,6 @@ from app.utils.ontology import (
     normalize_ontology_attribute,
     normalize_ontology_attributes,
 )
-from zep_cloud.external_clients.ontology import (
-    edge_model_to_api_schema,
-    entity_model_to_api_schema,
-)
 
 
 def test_normalize_string_attribute():
@@ -97,54 +93,6 @@ def test_graph_builder_safety_net_accepts_strings_and_skips_invalid_values():
 
     speaker = captured["entities"]["Speaker"]
     assert set(speaker.__annotations__) == {"role", "entity_summary"}
-
-
-def test_graph_builder_emits_a_pinned_zep_sdk_compatible_schema():
-    captured = {}
-
-    class GraphApi:
-        def set_ontology(self, **kwargs):
-            captured.update(kwargs)
-
-    class Client:
-        graph = GraphApi()
-
-    builder = object.__new__(GraphBuilderService)
-    builder.client = Client()
-    builder.set_ontology("graph-id", {
-        "entity_types": [{
-            "name": "Speaker",
-            "attributes": ["graph_id"] + [
-                f"field_{index}" for index in range(10)
-            ],
-        }],
-        "edge_types": [{
-            "name": "MENTIONS",
-            "attributes": [],
-            "source_targets": [{"source": "Speaker", "target": "Speaker"}],
-        }],
-    })
-
-    assert captured["graph_ids"] == ["graph-id"]
-
-    speaker = captured["entities"]["Speaker"]
-    entity_schema = entity_model_to_api_schema(speaker, "Speaker")
-    assert len(entity_schema["properties"]) == MAX_ONTOLOGY_ATTRIBUTES
-    assert entity_schema["properties"][0] == {
-        "name": "entity_graph_id",
-        "type": "Text",
-        "description": "graph_id",
-    }
-
-    mentions, source_targets = captured["edges"]["MENTIONS"]
-    edge_schema = edge_model_to_api_schema(mentions, "MENTIONS")
-    assert edge_schema["properties"] == [{
-        "name": "details",
-        "type": "Text",
-        "description": "Additional details about this ontology type.",
-    }]
-    assert source_targets[0].source == "Speaker"
-    assert source_targets[0].target == "Speaker"
 
 
 def test_graph_builder_passes_an_empty_entity_mapping_for_edge_only_ontology():

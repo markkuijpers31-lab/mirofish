@@ -71,7 +71,8 @@ import { useRoute, useRouter } from 'vue-router'
 import GraphPanel from '../components/GraphPanel.vue'
 import Step2EnvSetup from '../components/Step2EnvSetup.vue'
 import { getProject, getGraphData } from '../api/graph'
-import { getSimulation, stopSimulation, getEnvStatus, closeSimulationEnv } from '../api/simulation'
+import { getSimulation, getRunStatus } from '../api/simulation'
+import { requestSimulationStart } from '../store/pendingSimulationStart'
 import LanguageSwitcher from '../components/LanguageSwitcher.vue'
 import { useI18n } from 'vue-i18n'
 
@@ -171,6 +172,9 @@ const handleNextStep = (params = {}) => {
     routeParams.query = { maxRounds: params.maxRounds }
   }
   
+  // Explicit user action: allow Step 3 to start a run once
+  requestSimulationStart(currentSimulationId.value)
+
   // Navigate to Step 3 page
   router.push(routeParams)
 }
@@ -178,65 +182,18 @@ const handleNextStep = (params = {}) => {
 // --- Data Logic ---
 
 /**
- * Check and close running simulation
- * When user returns from Step 3 to Step 2, assume user wants to exit simulation
+ * Report (never stop) an existing run when the user returns to Step 2
+ * Re-opening an earlier step must not stop, restart or delete a run.
  */
-const checkAndStopRunningSimulation = async () => {
+const reportExistingRun = async () => {
   if (!currentSimulationId.value) return
-  
   try {
-    // First check if simulation environment is alive
-    const envStatusRes = await getEnvStatus({ simulation_id: currentSimulationId.value })
-    
-    if (envStatusRes.success && envStatusRes.data?.env_alive) {
-      addLog(t('log.detectedSimEnvRunning'))
-      
-      // Try graceful close of simulation environment
-      try {
-        const closeRes = await closeSimulationEnv({ 
-          simulation_id: currentSimulationId.value,
-          timeout: 10  // 10 second timeout
-        })
-        
-        if (closeRes.success) {
-          addLog(t('log.simEnvClosed'))
-        } else {
-          addLog(t('log.closeSimEnvFailedWithError', { error: closeRes.error || t('common.unknownError') }))
-          // If graceful close fails, try force stop
-          await forceStopSimulation()
-        }
-      } catch (closeErr) {
-        addLog(t('log.closeSimEnvException', { error: closeErr.message }))
-        // If graceful close throws, try force stop
-        await forceStopSimulation()
-      }
-    } else {
-      // Environment not running, but process may still exist, checking simulation status
-      const simRes = await getSimulation(currentSimulationId.value)
-      if (simRes.success && simRes.data?.status === 'running') {
-        addLog(t('log.detectedSimRunning'))
-        await forceStopSimulation()
-      }
+    const res = await getRunStatus(currentSimulationId.value)
+    if (res.success && res.data?.run_id) {
+      addLog(t('log.existingRunDetected', { runId: res.data.run_id, status: res.data.run_status }))
     }
   } catch (err) {
-    // Environment status check failure doesn't affect subsequent flow
-    console.warn('Failed to check simulation status:', err)
-  }
-}
-
-/**
- * Force stop simulation
- */
-const forceStopSimulation = async () => {
-  try {
-    const stopRes = await stopSimulation({ simulation_id: currentSimulationId.value })
-    if (stopRes.success) {
-      addLog(t('log.simForceStopSuccess'))
-    } else {
-      addLog(t('log.forceStopSimFailed', { error: stopRes.error || t('common.unknownError') }))
-    }
-  } catch (err) {
-    addLog(t('log.forceStopSimException', { error: err.message }))
+    console.warn('Failed to check run status:', err)
   }
 }
 
@@ -294,8 +251,8 @@ const refreshGraph = () => {
 onMounted(async () => {
   addLog(t('log.simViewInit'))
   
-  // Check and close running simulation (when user returns from Step 3)
-  await checkAndStopRunningSimulation()
+  // Show (never stop) an existing run when the user returns from Step 3
+  await reportExistingRun()
   
   // Load simulation data
   loadSimulationData()

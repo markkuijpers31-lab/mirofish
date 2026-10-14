@@ -32,16 +32,20 @@ docker compose up -d    # reads root .env, ports 3000+5001, mounts backend/uploa
 
 ### Tests
 
-**There are no automated tests.** `pytest` + `pytest-asyncio` are declared in
-`backend/pyproject.toml` but unused — no `tests/` dir, no `conftest.py`, no
-`[tool.pytest.ini_options]`. Frontend has no vitest/jest.
+Backend tests live in `backend/tests/` (pytest, `conftest.py` provides an
+isolated `uploads` fixture, a fake OASIS process and simulation/project helpers).
+Frontend has a dependency-free `node --test` suite in `frontend/tests/` for pure
+helpers (e.g. `src/utils/runLifecycle.js`).
 
-If you add tests, run them with:
 ```bash
 cd backend && uv run pytest                       # all
 cd backend && uv run pytest path/to/test_file.py  # single file
 cd backend && uv run pytest path/to/test_file.py::test_name  # single test
+cd frontend && npm test                           # frontend unit tests
 ```
+Some older tests (`test_ontology_*`, `test_platform_profiles`,
+`test_simulation_prepare_failure`) fail since the Zep removal; they describe
+behaviour that was lost then and are not related to the run model.
 `backend/scripts/test_profile_format.py` is a **manual print-based script**, not
 a pytest test — run it with `uv run python scripts/test_profile_format.py`.
 
@@ -146,13 +150,33 @@ maxRetries=3, delay=1000)` with exponential backoff. Per-resource modules
 
 **i18n:** `vue-i18n` `legacy: false`, `useI18n()`, `$t()`, `<i18n-t>` for rich
 inline text. Messages live in **root `locales/*.json`** (`en.json`, `zh.json`),
-shared with the backend's `utils/locale.py`. Persisted locale in `localStorage`
-(key `locale`, default `zh`).
+shared with the backend's `utils/locale.py` (only `en.json` exists in this fork).
+Persisted locale in `localStorage` (key `locale`, default `en`).
 
 **CSS:** Plain CSS, no preprocessor. `<style scoped>` default on components;
 `App.vue` has unscoped global resets. Global font: `'JetBrains Mono', 'Space
 Grotesk', 'Noto Sans SC', monospace`. Palette: black/white + orange
 (`#FF4500`/`#FF5722`).
+
+## Simulation Runs, Evidence and Reports
+
+- A simulation (`uploads/simulations/<sim_id>/`) is configuration (state, config,
+  profiles). Every execution is a **run** with its own immutable directory
+  `uploads/simulations/<sim_id>/runs/<run_id>/` (`services/run_store.py`): config +
+  profile snapshot, `personas.json`, `sources/`, `assessment/brief.md`,
+  `twitter|reddit/actions.jsonl`, `simulation.log`, DBs, IPC, `run.json`.
+- Run status (`run.json`): `not_started → running → completed|failed|stopped →
+  reporting → report_completed`. `POST /api/simulation/start` is idempotent; only
+  `new_run: true` (explicit, confirmed Restart) creates another run. Never delete or
+  append to another run's files; `force` is ignored.
+- Simulations from before runs existed are exposed read-only as run `legacy`.
+- Reports read the run's raw evidence directly (`services/run_evidence.py`); the
+  local graph is supplementary. Fixed evidence sections are built in
+  `services/report_evidence_sections.py` and validated in code (uncited claims →
+  missing). `GET /api/report/<id>/export` returns the audit ZIP.
+- Log run-scoped messages with `get_run_logger(name, simulation_id, run_id, area)`
+  so every line carries `[sim][run][area]`.
+- Step 3 must never start a run on mount; see `frontend/src/utils/runLifecycle.js`.
 
 ## Ports / Proxy
 

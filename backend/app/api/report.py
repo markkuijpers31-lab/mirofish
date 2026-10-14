@@ -3,6 +3,7 @@ Report API routes
 Provides endpoints for report generation, retrieval, and chat
 """
 
+import io
 import os
 import traceback
 import threading
@@ -12,9 +13,12 @@ from . import report_bp
 from ..config import Config
 from ..services.report_agent import ReportAgent, ReportManager, ReportStatus
 from ..services.simulation_manager import SimulationManager
+from ..services.simulation_runner import SimulationRunner
+from ..services.run_store import REPORTABLE_STATUSES, RunStatus, RunStore
+from ..services.run_export import build_run_bundle
 from ..models.project import ProjectManager
 from ..models.task import TaskManager, TaskStatus
-from ..utils.logger import get_logger
+from ..utils.logger import get_logger, get_run_logger
 from ..utils.locale import t, get_locale, set_locale
 
 logger = get_logger("mirofish.api.report")
@@ -31,10 +35,15 @@ def generate_report():
     This is a long-running operation; the endpoint returns a task_id
     immediately. Poll progress via GET /api/report/generate/status
 
+    The report is built from the raw evidence of ONE run (default: the current
+    run). Generating a report never starts, restarts or modifies a simulation;
+    it can be repeated on the same immutable run evidence.
+
     Request (JSON):
         {
             "simulation_id": "sim_xxxx",    // required, simulation ID
-            "force_regenerate": false        // optional, force regeneration
+            "run_id": "run_xxxx",           // optional, default: current run
+            "force_regenerate": false        // optional, generate a new report even if one exists
         }
 
     Returns:
@@ -71,15 +80,35 @@ def generate_report():
                 }
             ), 404
 
-        # Check if a report already exists
+        # Resolve the run whose evidence the report is built from
+        run_id = RunStore.resolve_run_id(simulation_id, data.get("run_id"))
+        run = SimulationRunner.reconcile_run(
+            simulation_id, RunStore.get_run(simulation_id, run_id) if run_id else None
+        )
+        if run is None:
+            return jsonify(
+                {"success": False, "error": f"Simulation {simulation_id} has no run to report on"}
+            ), 400
+        if run.status not in REPORTABLE_STATUSES:
+            return jsonify(
+                {
+                    "success": False,
+                    "error": f"Run {run.run_id} has status '{run.status.value}'; "
+                    f"a report can only be generated from a finished run",
+                }
+            ), 400
+        run_log = get_run_logger("mirofish.api.report", simulation_id, run.run_id, "report")
+
+        # Check if a report already exists for this run
         if not force_regenerate:
-            existing_report = ReportManager.get_report_by_simulation(simulation_id)
+            existing_report = ReportManager.get_report_by_simulation(simulation_id, run.run_id)
             if existing_report and existing_report.status == ReportStatus.COMPLETED:
                 return jsonify(
                     {
                         "success": True,
                         "data": {
                             "simulation_id": simulation_id,
+                            "run_id": run.run_id,
                             "report_id": existing_report.report_id,
                             "status": "completed",
                             "message": t("api.reportAlreadyExists"),
@@ -98,11 +127,10 @@ def generate_report():
                 }
             ), 404
 
-        graph_id = state.graph_id or project.graph_id
+        # The graph is a supplementary source only: a missing graph does not block a report
+        graph_id = state.graph_id or project.graph_id or ""
         if not graph_id:
-            return jsonify(
-                {"success": False, "error": t("api.missingGraphIdEnsure")}
-            ), 400
+            run_log.warning("No graph available; report uses raw run evidence only")
 
         simulation_requirement = project.simulation_requirement
         if not simulation_requirement:
@@ -121,10 +149,17 @@ def generate_report():
             task_type="report_generate",
             metadata={
                 "simulation_id": simulation_id,
+                "run_id": run.run_id,
                 "graph_id": graph_id,
                 "report_id": report_id,
             },
         )
+
+        report_run_id = run.run_id
+        previous_run_status = run.status if run.status != RunStatus.REPORTING else RunStatus.COMPLETED
+        RunStore.set_status(simulation_id, report_run_id, RunStatus.REPORTING)
+        RunStore.add_report(simulation_id, report_run_id, report_id)
+        run_log.info(f"Report generation requested: {report_id}")
 
         # Capture locale before spawning background thread
         current_locale = get_locale()
@@ -140,11 +175,12 @@ def generate_report():
                     message=t("api.initReportAgent"),
                 )
 
-                # Create Report Agent
+                # Create Report Agent bound to the run's evidence
                 agent = ReportAgent(
                     graph_id=graph_id,
                     simulation_id=simulation_id,
                     simulation_requirement=simulation_requirement,
+                    run_id=report_run_id,
                 )
 
                 # Progress callback
@@ -162,21 +198,33 @@ def generate_report():
                 ReportManager.save_report(report)
 
                 if report.status == ReportStatus.COMPLETED:
+                    RunStore.set_status(
+                        simulation_id, report_run_id, RunStatus.REPORT_COMPLETED,
+                        last_report_error=None,
+                    )
                     task_manager.complete_task(
                         task_id,
                         result={
                             "report_id": report.report_id,
                             "simulation_id": simulation_id,
+                            "run_id": report_run_id,
                             "status": "completed",
                         },
                     )
                 else:
+                    RunStore.set_status(
+                        simulation_id, report_run_id, previous_run_status,
+                        last_report_error=report.error,
+                    )
                     task_manager.fail_task(
                         task_id, report.error or t("api.reportGenerateFailed")
                     )
 
             except Exception as e:
-                logger.error(f"Report generation failed: {str(e)}")
+                run_log.error(f"Report generation failed: {str(e)}")
+                RunStore.set_status(
+                    simulation_id, report_run_id, previous_run_status, last_report_error=str(e)
+                )
                 task_manager.fail_task(task_id, str(e))
 
         # Start background thread
@@ -188,6 +236,7 @@ def generate_report():
                 "success": True,
                 "data": {
                     "simulation_id": simulation_id,
+                    "run_id": report_run_id,
                     "report_id": report_id,
                     "task_id": task_id,
                     "status": "generating",
@@ -943,6 +992,45 @@ def get_graph_statistics_tool():
 
     except Exception as e:
         logger.error(f"Failed to get graph statistics: {str(e)}")
+        return jsonify(
+            {"success": False, "error": str(e), "traceback": traceback.format_exc()}
+        ), 500
+
+
+# ============== Run export ==============
+
+
+@report_bp.route("/<report_id>/export", methods=["GET"])
+def export_report_bundle(report_id: str):
+    """
+    Download the complete, auditable bundle (ZIP) of a report and its run
+
+    Contains run metadata, config, personas, source documents, assessment brief,
+    raw Twitter/Reddit action logs, normalized evidence, the final report
+    (Markdown + JSON) and the report-agent logs. See run_export.README.
+
+    Returns:
+        application/zip attachment
+    """
+    try:
+        report = ReportManager.get_report(report_id)
+        if not report:
+            return jsonify(
+                {"success": False, "error": t("api.reportNotFound", id=report_id)}
+            ), 404
+        data, filename = build_run_bundle(
+            report.simulation_id, report.run_id, report_id=report_id
+        )
+        return send_file(
+            io.BytesIO(data),
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=filename,
+        )
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    except Exception as e:
+        logger.error(f"Failed to export report bundle: {str(e)}")
         return jsonify(
             {"success": False, "error": str(e), "traceback": traceback.format_exc()}
         ), 500

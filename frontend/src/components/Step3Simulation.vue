@@ -91,6 +91,25 @@
       </div>
 
       <div class="action-controls">
+        <span v-if="currentRunId" class="run-badge" :class="'run-' + (currentRunStatus || 'unknown')" :title="currentRunId">
+          {{ runStatusLabel }} · {{ shortRunId }}
+        </span>
+        <button
+          v-if="phase === 0 && !currentRunId"
+          class="action-btn primary"
+          :disabled="isStarting"
+          @click="handleStartClick"
+        >
+          {{ $t('step3.startSimulationBtn') }}
+        </button>
+        <button
+          v-if="currentRunId && phase === 2"
+          class="action-btn secondary"
+          :disabled="isStarting || isGeneratingReport"
+          @click="handleRestart"
+        >
+          {{ $t('step3.restartSimulationBtn') }}
+        </button>
         <button 
           class="action-btn primary"
           :disabled="phase !== 2 || isGeneratingReport"
@@ -296,6 +315,8 @@ import {
   getRunStatusDetail
 } from '../api/simulation'
 import { generateReport } from '../api/report'
+import { consumeSimulationStartRequest } from '../store/pendingSimulationStart'
+import { decideStep3MountAction } from '../utils/runLifecycle'
 
 const { t } = useI18n()
 
@@ -322,6 +343,8 @@ const isStarting = ref(false)
 const isStopping = ref(false)
 const startError = ref(null)
 const runStatus = ref({})
+const currentRunId = ref(null) // Run (execution) this view is bound to
+const currentRunStatus = ref(null) // Persistent run status from the backend
 const allActions = ref([]) // All actions (incremental accumulation)
 const actionIds = ref(new Set()) // Action ID set for deduplication
 const scrollContainer = ref(null)
@@ -360,9 +383,18 @@ const redditElapsedTime = computed(() => {
   return formatElapsedTime(runStatus.value.reddit_current_round || 0)
 })
 
+const runStatusLabel = computed(() => (currentRunStatus.value || 'unknown').replace('_', ' ').toUpperCase())
+const shortRunId = computed(() => currentRunId.value || '')
+
 // Methods
 const addLog = (msg) => {
   emit('add-log', msg)
+}
+
+const applyRunInfo = (data) => {
+  if (!data) return
+  if (data.run_id) currentRunId.value = data.run_id
+  if (data.run_status) currentRunStatus.value = data.run_status
 }
 
 // Reset all state (for simulation restart)
@@ -376,11 +408,37 @@ const resetAllState = () => {
   startError.value = null
   isStarting.value = false
   isStopping.value = false
+  currentRunId.value = null
+  currentRunStatus.value = null
   stopPolling()  // Stop any previous polling
 }
 
-// Start simulation
-const doStartSimulation = async () => {
+// Attach to an active run: poll it, never start another one
+const attachToRun = (data) => {
+  applyRunInfo(data)
+  runStatus.value = data
+  phase.value = 1
+  emit('update-status', 'processing')
+  stopPolling()
+  startStatusPolling()
+  startDetailPolling()
+  fetchRunStatusDetail()
+}
+
+// Show a finished run as it is (no restart, no cleanup)
+const showFinishedRun = (data) => {
+  applyRunInfo(data)
+  runStatus.value = data
+  phase.value = 2
+  stopPolling()
+  fetchRunStatusDetail()
+  addLog(t('log.existingRunLoaded', { runId: data.run_id, status: data.run_status }))
+  emit('update-status', data.run_status === 'failed' ? 'error' : 'completed')
+}
+
+// Start a simulation run. Only called from an explicit user action
+// (Step 2 start click, Start button, or confirmed Restart).
+const doStartSimulation = async ({ newRun = false } = {}) => {
   if (!props.simulationId) {
     addLog(t('log.errorMissingSimId'))
     return
@@ -391,15 +449,16 @@ const doStartSimulation = async () => {
   
   isStarting.value = true
   startError.value = null
-  addLog(t('log.startingDualSim'))
+  addLog(newRun ? t('log.restartingAsNewRun') : t('log.startingDualSim'))
   emit('update-status', 'processing')
   
   try {
     const params = {
       simulation_id: props.simulationId,
       platform: 'parallel',
-      force: true,  // Force restart
-      enable_graph_memory_update: true  // Enable dynamic graph update
+    }
+    if (newRun) {
+      params.new_run = true
     }
     
     if (props.maxRounds) {
@@ -407,19 +466,29 @@ const doStartSimulation = async () => {
       addLog(t('log.setMaxRounds', { rounds: props.maxRounds }))
     }
     
-    addLog(t('log.graphMemoryUpdateEnabled'))
-    
     const res = await startSimulation(params)
     
     if (res.success && res.data) {
-      if (res.data.force_restarted) {
-        addLog(t('log.oldSimCleared'))
+      const data = res.data
+      if (data.already_running) {
+        addLog(t('log.attachedToRunningRun', { runId: data.run_id }))
+        attachToRun(data)
+        return
+      }
+      if (data.run_exists) {
+        showFinishedRun(data)
+        return
+      }
+      applyRunInfo(data)
+      addLog(t('log.runCreated', { runId: data.run_id }))
+      if (data.previous_run_id) {
+        addLog(t('log.previousRunKept', { runId: data.previous_run_id }))
       }
       addLog(t('log.engineStarted'))
-      addLog(`  ├─ PID: ${res.data.process_pid || '-'}`)
+      addLog(`  ├─ PID: ${data.process_pid || '-'}`)
       
       phase.value = 1
-      runStatus.value = res.data
+      runStatus.value = data
       
       startStatusPolling()
       startDetailPolling()
@@ -435,6 +504,18 @@ const doStartSimulation = async () => {
   } finally {
     isStarting.value = false
   }
+}
+
+const handleStartClick = () => {
+  doStartSimulation()
+}
+
+// Explicit restart: always a NEW run; the previous run and its evidence are kept
+const handleRestart = () => {
+  if (!window.confirm(t('step3.restartConfirm', { runId: currentRunId.value || '-' }))) {
+    return
+  }
+  doStartSimulation({ newRun: true })
 }
 
 // Stop simulation
@@ -493,12 +574,13 @@ const fetchRunStatus = async () => {
   if (!props.simulationId) return
   
   try {
-    const res = await getRunStatus(props.simulationId)
+    const res = await getRunStatus(props.simulationId, currentRunId.value)
     
     if (res.success && res.data) {
       const data = res.data
       
       runStatus.value = data
+      applyRunInfo(data)
       
       // Detect round changes per platform and log
       if (data.twitter_current_round > prevTwitterRound.value) {
@@ -567,7 +649,7 @@ const fetchRunStatusDetail = async () => {
   if (!props.simulationId) return
   
   try {
-    const res = await getRunStatusDetail(props.simulationId)
+    const res = await getRunStatusDetail(props.simulationId, currentRunId.value)
     
     if (res.success && res.data) {
       // Use all_actions to get full action list
@@ -662,8 +744,10 @@ const handleNextStep = async () => {
   addLog(t('log.startingReportGen'))
   
   try {
+    // Report generation only reads this run's evidence; it never starts a simulation
     const res = await generateReport({
       simulation_id: props.simulationId,
+      run_id: currentRunId.value,
       force_regenerate: true
     })
     
@@ -693,10 +777,36 @@ watch(() => props.systemLogs?.length, () => {
   })
 })
 
-onMounted(() => {
+// Mounting (navigation, reload, back button) never starts or restarts a run:
+// it reads the persistent run state and only starts when the user explicitly
+// clicked "Start" in Step 2 right before.
+onMounted(async () => {
   addLog(t('log.step3Init'))
-  if (props.simulationId) {
+  if (!props.simulationId) return
+
+  const pendingStart = consumeSimulationStartRequest(props.simulationId)
+  let data = null
+  try {
+    const res = await getRunStatus(props.simulationId)
+    data = res.success ? res.data : null
+  } catch (err) {
+    addLog(t('log.startException', { error: err.message }))
+    return
+  }
+
+  const action = decideStep3MountAction({
+    runStatus: data?.run_id ? data.run_status : undefined,
+    pendingStart,
+  })
+  if (action === 'attach') {
+    addLog(t('log.attachedToRunningRun', { runId: data.run_id }))
+    attachToRun(data)
+  } else if (action === 'show_finished') {
+    showFinishedRun(data)
+  } else if (action === 'start') {
     doStartSimulation()
+  } else {
+    addLog(t('log.noRunYet'))
   }
 })
 
@@ -902,9 +1012,57 @@ onUnmounted(() => {
   background: #333;
 }
 
+.action-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.action-btn.secondary {
+  background: #FFF;
+  color: #000;
+  border: 1px solid #000;
+}
+
+.action-btn.secondary:hover:not(:disabled) {
+  background: #F5F5F5;
+}
+
 .action-btn:disabled {
   opacity: 0.3;
   cursor: not-allowed;
+}
+
+.run-badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 10px;
+  border-radius: 4px;
+  border: 1px solid #CCC;
+  color: #333;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-badge.run-completed,
+.run-badge.run-report_completed {
+  border-color: #1A7F37;
+  color: #1A7F37;
+}
+
+.run-badge.run-running,
+.run-badge.run-reporting {
+  border-color: #FF5722;
+  color: #FF5722;
+}
+
+.run-badge.run-failed,
+.run-badge.run-stopped {
+  border-color: #B42318;
+  color: #B42318;
 }
 
 /* --- Main Content Area --- */
