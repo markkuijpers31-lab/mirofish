@@ -3,6 +3,7 @@ Evidence-bound report sections: per-persona funnel analysis, hypothesis assessme
 """
 
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 from .agent_selection import EVIDENCE_TARGET_CONSUMER
@@ -47,6 +48,13 @@ Rules:
   not in the list.
 - Keep negative evidence (objections, distrust, complaints, choosing an alternative, abandoning).
 - Never invent steps, motives, prices, plans or outcomes that the actions do not show.
+- Product capabilities: when an AUTHORITATIVE product document is provided, it is the only basis for
+  saying what the product can or cannot do. A capability that is absent from a snippet or from the
+  persona's posts is NOT evidence that the product lacks it. If the persona believes something is
+  missing, report it as the persona's belief and say whether the authoritative document contradicts it.
+- The private orchestration timeline (instructions and exposures the experiment delivered) is context:
+  it tells you what the persona was told and when, but it is never evidence of the persona's behaviour.
+- Likes, favourable comments, questions or "sounds useful" are not trial, adoption, payment or return.
 - No percentages or conversion rates.
 - Write summaries in the requested report language.
 
@@ -62,6 +70,8 @@ actions, each with a reference like [TW-00012] or [RD-00003].
 
 Rules:
 - Only simulated actions count as evidence. Cite their refs; never cite refs not provided.
+- When an AUTHORITATIVE product document is provided it decides what the product can and cannot do;
+  absence of a capability from snippets or posts is never evidence that it does not exist.
 - Each action shows [simulation_role/evidence_role]. Conversion, adoption or acquisition claims may
   only rest on actions of evidence role target_consumer. Existing users, advocates and platform
   accounts can show influence on prospects, but never count as conversions.
@@ -146,10 +156,97 @@ class StructuredReportBuilder:
             return personas
         return [cid for cid in personas if self.evidence.persona_evidence_role(cid) == EVIDENCE_TARGET_CONSUMER]
 
+    # Authoritative documents are passed in full (up to this budget) so capability
+    # judgements never rest on a partial excerpt
+    AUTHORITATIVE_BUDGET = 60000
+
     def _context_documents(self, budget: int = 3000) -> str:
         if not self.evidence or not self.evidence.sources:
             return "(no source documents available)"
-        return self.evidence.source_excerpts(max_chars=budget)
+        parts = []
+        authoritative = self.evidence.authoritative_documents()
+        for doc in authoritative:
+            text = doc["text"]
+            if len(text) > self.AUTHORITATIVE_BUDGET:
+                self._warn(f"Authoritative document {doc['filename']} truncated to {self.AUTHORITATIVE_BUDGET} chars")
+                text = text[: self.AUTHORITATIVE_BUDGET] + "\n...(truncated)"
+            self.evidence.mark_source_used(doc["filename"])
+            parts.append(
+                f"AUTHORITATIVE PRODUCT DOCUMENT ({doc['label']}, complete): the only valid basis for what the "
+                f"product does and does not do.\n{text}"
+            )
+        parts.append("Other source excerpts (context only):\n" + self.evidence.source_excerpts(max_chars=budget))
+        return "\n\n".join(parts)
+
+    def _timeline_text(self, cid: str) -> str:
+        timeline = self.evidence.persona_stage_timeline(cid) if self.evidence else []
+        if not timeline:
+            return "(no private instructions or exposures were delivered to this persona)"
+        return "\n".join(
+            f"- round {t['round']}: stage '{t['stage_name']}' {t['event']}"
+            + (f" (records {', '.join(t['records'])})" if t["records"] else "")
+            for t in timeline
+        )
+
+    def _apply_orchestration_records(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Fields named after an orchestration record (e.g. EXPOSED) are decided by the
+        delivered stages only: they describe what the experiment did, not behaviour.
+        """
+        if not self.evidence or not (self.evidence.plan_record_labels or self.evidence.derived_fields):
+            return result
+        cid = result["canonical_id"]
+        records = self.evidence.persona_records(cid) if result.get("present_in_simulation") else {}
+        result["stage_timeline"] = self.evidence.persona_stage_timeline(cid) if result.get("present_in_simulation") else []
+        labels = set(self.evidence.plan_record_labels)
+        for field in result.get("fields", []):
+            label = re.sub(r"[^A-Z0-9]+", "_", field["field"].upper()).strip("_")
+            if label not in labels:
+                continue
+            if label in records:
+                field.update({"status": "observed", "refs": [], "method": "orchestration",
+                              "summary": f"Orchestration fact: recorded in round {records[label]} (not behaviour)."})
+            else:
+                field.update({"status": "missing", "refs": [], "method": "orchestration",
+                              "summary": "Not delivered to this persona by the experiment."})
+        self._apply_derived_fields(result, records)
+        result["missing_stages"] = [f["field"] for f in result.get("fields", []) if f["status"] == "missing"]
+        return result
+
+    def _apply_derived_fields(self, result: Dict[str, Any], records: Dict[str, int]):
+        """Fields the plan defines as derived from the complete log (e.g. organic discovery)"""
+        rules = self.evidence.derived_fields if self.evidence else {}
+        if not rules:
+            return
+        present = bool(result.get("present_in_simulation"))
+        for field in result.get("fields", []):
+            label = re.sub(r"[^A-Z0-9]+", "_", field["field"].upper()).strip("_")
+            rule = rules.get(label)
+            if not rule:
+                continue
+            if rule.get("evidence_roles") and result.get("evidence_role") not in rule["evidence_roles"]:
+                field.update({"status": "missing", "refs": [], "method": "derived",
+                              "summary": f"Not applicable to evidence role {result.get('evidence_role')}."})
+                continue
+            encounter = self.evidence.first_encounter(result["canonical_id"], rule["terms"]) if present else None
+            record_round = records.get(rule.get("record") or "")
+            before = encounter is not None and (record_round is None or encounter["round"] < record_round)
+            terms = ", ".join(rule["terms"])
+            when = f"before {rule['record']} (round {record_round})" if record_round is not None else "during the run"
+            if rule["type"] == "first_encounter_before_record":
+                if before:
+                    field.update({"status": "observed", "refs": [encounter["ref"]], "method": "derived",
+                                  "summary": f"First own or reacted-to mention of {terms} in round {encounter['round']}, {when}."})
+                else:
+                    field.update({"status": "missing", "refs": [], "method": "derived",
+                                  "summary": f"No mention of {terms} {when}."})
+            elif present:
+                if before:
+                    field.update({"status": "missing", "refs": [], "method": "derived",
+                                  "summary": f"Encountered {terms} in round {encounter['round']}, {when}."})
+                else:
+                    field.update({"status": "observed", "refs": [], "method": "derived",
+                                  "summary": f"No own or reacted-to mention of {terms} {when} (complete log checked)."})
 
     def _missing_result(self, cid: str, display: str, reason: str, present: bool, counts: Dict[str, int]) -> Dict[str, Any]:
         fields = [
@@ -213,6 +310,7 @@ class StructuredReportBuilder:
                 r["simulation_role"] = self.evidence.persona_simulation_role(r["canonical_id"])
                 r["evidence_role"] = self.evidence.persona_evidence_role(r["canonical_id"])
                 r["counts_in_conversion_metrics"] = r["evidence_role"] == EVIDENCE_TARGET_CONSUMER
+            self._apply_orchestration_records(r)
         self.persona_results = results
         self._info(f"Persona analysis done: {len(results)} personas, {llm_calls} LLM calls")
         return results
@@ -234,7 +332,10 @@ class StructuredReportBuilder:
             *[f"- {f}" for f in self.spec.funnel_fields],
             "",
             "Assessment brief (context):",
-            self.evidence.brief_text[:3000],
+            self.evidence.brief_text[:12000],
+            "",
+            "Private orchestration timeline (experiment facts, NOT behaviour, not citable):",
+            self._timeline_text(cid),
             "",
             "Product / source documents (context, not evidence of behaviour):",
             self._context_documents(),
@@ -321,7 +422,8 @@ class StructuredReportBuilder:
         lines.append("")
         if not self.persona_results:
             lines.append("No personas available to analyse: this run has no simulation evidence.")
-        for r in self.persona_results:
+        lines += self._render_cohort_summary()
+        for r in self._results_by_cohort():
             counts = r.get("action_counts", {})
             count_text = ", ".join(f"{k} {v}" for k, v in counts.items() if k != "total")
             lines.append(f"**{r['canonical_id']} — {_cell(r['display_name'], 120)}**")
@@ -346,6 +448,8 @@ class StructuredReportBuilder:
             lines.append("|---|---|---|---|")
             for f in r["fields"]:
                 status = f["status"].upper() if f["status"] == "missing" else f["status"]
+                if f.get("method") in ("orchestration", "derived"):
+                    status += f" ({f['method']})"
                 lines.append(f"| {_cell(f['field'], 60)} | {status} | {_cell(f['summary'])} | {_cell(', '.join(f['refs']), 120)} |")
             lines.append("")
             for label, key in (("Strongest evidence for", "strongest_evidence_for"), ("Strongest evidence against", "strongest_evidence_against")):
@@ -356,6 +460,41 @@ class StructuredReportBuilder:
             lines.append(f"- **Missing / unobserved stages:** {', '.join(missing) if missing else 'none'}")
             lines.append("")
         return "\n".join(lines).strip()
+
+    def _results_by_cohort(self) -> List[Dict[str, Any]]:
+        """Persona results ordered by cohort (simulation role), keeping the brief's order within a cohort"""
+        order: List[str] = []
+        for r in self.persona_results:
+            role = r.get("simulation_role") or "not present"
+            if role not in order:
+                order.append(role)
+        return sorted(self.persona_results, key=lambda r: order.index(r.get("simulation_role") or "not present"))
+
+    def _render_cohort_summary(self) -> List[str]:
+        """Per-cohort counts of observed / ambiguous / missing for every funnel field"""
+        cohorts: Dict[str, List[Dict[str, Any]]] = {}
+        for r in self._results_by_cohort():
+            cohorts.setdefault(r.get("simulation_role") or "not present", []).append(r)
+        if not cohorts or not self.spec.funnel_fields:
+            return []
+        names = list(cohorts)
+        lines = [
+            "**Cohort summary** (observed / ambiguous / missing personas per field; acquisition and conversion "
+            "denominators use target-consumer cohorts only)",
+            "",
+            "| Field | " + " | ".join(
+                f"{_cell(n, 40)} (n={len(cohorts[n])}{', target' if any(x.get('counts_in_conversion_metrics') for x in cohorts[n]) else ''})"
+                for n in names) + " |",
+            "|---|" + "---|" * len(names),
+        ]
+        for field in self.spec.funnel_fields:
+            cells = []
+            for n in names:
+                statuses = [next((f["status"] for f in r["fields"] if f["field"] == field), "missing") for r in cohorts[n]]
+                cells.append(f"{statuses.count('observed')} / {statuses.count('ambiguous')} / {statuses.count('missing')}")
+            lines.append(f"| {_cell(field, 60)} | " + " | ".join(cells) + " |")
+        lines.append("")
+        return lines
 
     # ---------- hypotheses ----------
 
@@ -401,6 +540,9 @@ class StructuredReportBuilder:
                 "",
                 "Relevant simulated actions:",
                 "\n".join(RunEvidence.format_action(a) for a in relevant),
+                "",
+                "Product documents (context, not evidence of behaviour):",
+                self._context_documents(budget=1500),
             ])
             try:
                 data = self.llm.chat_json(

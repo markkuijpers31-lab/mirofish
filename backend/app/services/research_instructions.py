@@ -32,8 +32,19 @@ ORIGIN_RESEARCHER_INSTRUCTION = "researcher_instruction"
 ORIGIN_ORCHESTRATION = "orchestration"
 ORIGINS = (ORIGIN_AGENT_GENERATED, ORIGIN_SYSTEM_SEED, ORIGIN_RESEARCHER_INSTRUCTION, ORIGIN_ORCHESTRATION)
 
-CONDITION_TYPES = ("always", "not_mentioned", "mentioned", "stage_completed", "stage_not_completed")
-COMPLETION_TYPES = ("on_delivery", "mentioned", "action_types", "any_action", "rounds_elapsed")
+# mentioned / not_mentioned look at everything an agent wrote or reacted to (what it
+# has encountered); authored_* only at text the agent itself wrote or searched for.
+CONDITION_TYPES = (
+    "always", "not_mentioned", "mentioned", "authored_mentioned", "authored_not_mentioned",
+    "stage_completed", "stage_not_completed",
+)
+COMPLETION_TYPES = ("on_delivery", "mentioned", "authored_mentioned", "action_types", "any_action", "rounds_elapsed")
+# Report fields decided deterministically from the complete action log:
+#   first_encounter_before_record: the persona wrote or reacted to content containing a
+#       term before the given orchestration record was delivered (or without it)
+#   no_encounter_before_record: the opposite
+DERIVED_FIELD_TYPES = ("first_encounter_before_record", "no_encounter_before_record")
+_RECORD_LABEL_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,40}$")
 
 # Words that mark research/experiment instructions (never in-world social content)
 _INSTRUCTION_MARKERS_RE = re.compile(
@@ -205,6 +216,9 @@ def _default_stage(index: int) -> Dict[str, Any]:
         "trigger_round": 1,
         "target": {"agent_ids": [], "persona_ids": [], "simulation_roles": [], "evidence_roles": []},
         "private_instruction": "",
+        "context": "",
+        "context_sections": [],
+        "records": [],
         "condition": {"type": "always"},
         "completion": {"type": "on_delivery"},
         "source": "user",
@@ -290,7 +304,7 @@ def validate_plan(plan: Any, role_ids: Optional[Iterable[str]] = None) -> Dict[s
             raise ValueError(f"Stage {stage_id}: unknown condition type {condition.get('type')}")
         condition["type"] = condition.get("type", "always")
         condition["terms"] = _str_list(condition.get("terms"))
-        if condition["type"] in ("mentioned", "not_mentioned") and not condition["terms"]:
+        if condition["type"] in ("mentioned", "not_mentioned", "authored_mentioned", "authored_not_mentioned") and not condition["terms"]:
             raise ValueError(f"Stage {stage_id}: condition '{condition['type']}' needs terms")
         if condition["type"] in ("stage_completed", "stage_not_completed") and not condition.get("stage_id"):
             raise ValueError(f"Stage {stage_id}: condition '{condition['type']}' needs stage_id")
@@ -300,8 +314,12 @@ def validate_plan(plan: Any, role_ids: Optional[Iterable[str]] = None) -> Dict[s
             raise ValueError(f"Stage {stage_id}: unknown completion type {completion['type']}")
         completion["terms"] = _str_list(completion.get("terms"))
         completion["action_types"] = [a.upper() for a in _str_list(completion.get("action_types"))]
-        if completion["type"] == "mentioned" and not completion["terms"]:
-            raise ValueError(f"Stage {stage_id}: completion 'mentioned' needs terms")
+        if completion["type"] in ("mentioned", "authored_mentioned") and not completion["terms"]:
+            raise ValueError(f"Stage {stage_id}: completion '{completion['type']}' needs terms")
+        records = [str(r).strip().upper() for r in raw.get("records") or [] if str(r).strip()]
+        if any(not _RECORD_LABEL_RE.match(r) for r in records):
+            raise ValueError(f"Stage {stage_id}: records must be UPPER_SNAKE labels, got {records}")
+        context_sections = _str_list(raw.get("context_sections"))
         if completion["type"] == "action_types" and not completion["action_types"]:
             raise ValueError(f"Stage {stage_id}: completion 'action_types' needs action_types")
         if completion["type"] == "rounds_elapsed":
@@ -321,18 +339,41 @@ def validate_plan(plan: Any, role_ids: Optional[Iterable[str]] = None) -> Dict[s
                 "evidence_roles": ev_roles,
             },
             "private_instruction": instruction,
+            # Factual product context delivered with the instruction. It is public
+            # information (e.g. product documentation), so it is not part of the
+            # leak guard: agents may legitimately repeat these facts.
+            "context": str(raw.get("context") or "").strip(),
+            "context_sections": context_sections,
+            # Orchestration facts recorded for the targeted agents on delivery
+            # (e.g. EXPOSED). Facts about the experiment, never behaviour.
+            "records": records,
             "condition": condition,
             "completion": completion,
             "source": raw.get("source") if raw.get("source") in ("user", "brief") else "user",
         })
         stages.append(stage)
+    # Terms seed posts may not contain (e.g. the product under test), so system
+    # content never causes "organic" discovery
+    seed_blocked_terms = _str_list(plan.get("seed_blocked_terms"))
+    derived_fields = {}
+    for name, rule in (plan.get("derived_fields") or {}).items():
+        label = re.sub(r"[^A-Z0-9]+", "_", str(name).upper()).strip("_")
+        if not isinstance(rule, dict) or rule.get("type") not in DERIVED_FIELD_TYPES:
+            raise ValueError(f"derived field {name}: type must be one of {DERIVED_FIELD_TYPES}")
+        terms = _str_list(rule.get("terms"))
+        if not terms:
+            raise ValueError(f"derived field {name}: terms are required")
+        derived_fields[label] = {"type": rule["type"], "terms": terms, "record": str(rule.get("record") or "").upper(),
+                                 # Only decide the field for these evidence roles (empty = everyone)
+                                 "evidence_roles": _str_list(rule.get("evidence_roles"))}
     known = {s["id"] for s in stages}
     for s in stages:
         ref = s["condition"].get("stage_id")
         if ref and ref not in known:
             raise ValueError(f"Stage {s['id']}: condition refers to unknown stage {ref}")
     stages.sort(key=lambda s: (s["order"], s["trigger_round"]))
-    return {"version": PLAN_VERSION, "stages": stages}
+    return {"version": PLAN_VERSION, "stages": stages, "seed_blocked_terms": seed_blocked_terms,
+            "derived_fields": derived_fields}
 
 
 def resolve_plan(plan: Dict[str, Any], roster: Dict[str, Any], extra_private_texts: Iterable[str] = ()) -> Dict[str, Any]:
@@ -382,6 +423,8 @@ def resolve_plan(plan: Dict[str, Any], roster: Dict[str, Any], extra_private_tex
     return {
         "version": PLAN_VERSION,
         "stages": resolved_stages,
+        "seed_blocked_terms": list(plan.get("seed_blocked_terms") or []),
+        "derived_fields": dict(plan.get("derived_fields") or {}),
         "private_texts": private_texts,
         "unresolved_stages": [s["id"] for s in resolved_stages if not s["resolved_agent_ids"]],
     }
@@ -453,6 +496,24 @@ def load_project_brief(project_id: Optional[str]) -> Dict[str, Any]:
     }
 
 
+def _run_source_documents(run_dir: str) -> List[Dict[str, Any]]:
+    """Source documents of a run from its own snapshot (sources/manifest.json)"""
+    manifest_path = os.path.join(run_dir, "sources", "manifest.json")
+    if not os.path.exists(manifest_path):
+        return []
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    documents = []
+    for doc in manifest.get("documents", []):
+        text_path = os.path.join(run_dir, "sources", doc.get("text_file") or "")
+        text = ""
+        if doc.get("text_file") and os.path.exists(text_path):
+            with open(text_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        documents.append({**doc, "text": text})
+    return documents
+
+
 def snapshot_run_plan(run_dir: str, simulation_id: str) -> Dict[str, Any]:
     """
     Resolve the experiment plan for one run and write it into the run directory
@@ -497,7 +558,22 @@ def snapshot_run_plan(run_dir: str, simulation_id: str) -> Dict[str, Any]:
         plan, source = validate_plan(saved), "saved"
     else:
         plan, source = validate_plan(plan_from_brief(brief_text, extract_spec_regex(brief_text).persona_ids)), "brief"
+    wanted = [sid for s in plan["stages"] for sid in s.get("context_sections") or []]
+    if wanted:
+        from .source_requirements import REQUIREMENTS_FILE, section_texts
+
+        texts = section_texts(_read(REQUIREMENTS_FILE), _run_source_documents(run_dir), wanted)
+        for stage in plan["stages"]:
+            parts = [stage.get("context") or ""] + [texts[sid] for sid in stage.get("context_sections") or []]
+            stage["context"] = "\n\n".join(p for p in parts if p)
     resolved = resolve_plan(plan, roster, list(config.get("private_texts") or []) + brief_instructions)
+    if source == "saved" and resolved["unresolved_stages"]:
+        # A saved stage that reaches nobody would silently never fire (e.g. a persona
+        # id that is not part of any active agent's name): refuse the run instead
+        raise ValueError(
+            f"Stages target no active agent: {resolved['unresolved_stages']}. "
+            "Check the persona ids / roles of these stages against the agent selection."
+        )
     resolved["source"] = source
     resolved["simulation_id"] = simulation_id
     resolved["resolved_at"] = datetime.now().isoformat()

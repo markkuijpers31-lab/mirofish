@@ -250,6 +250,9 @@ class RunEvidence:
         self.roles_note = ""
         self.agent_roles: Dict[int, Dict[str, Any]] = {}
         self.orchestration_events: List[Dict[str, Any]] = []
+        self.source_requirements: Optional[Dict[str, Any]] = None
+        self.plan_record_labels: List[str] = []
+        self.derived_fields: Dict[str, Dict[str, Any]] = {}
 
     # ---------- loading ----------
 
@@ -274,6 +277,10 @@ class RunEvidence:
     def _load_all(self):
         self.config = _read_json(os.path.join(self.run_dir, "simulation_config.json"), {}) or {}
         self._load_sources_and_brief()
+        self.source_requirements = _read_json(os.path.join(self.run_dir, "source_requirements.json"), None)
+        plan = _read_json(os.path.join(self.run_dir, "experiment_plan.json"), {}) or {}
+        self.plan_record_labels = sorted({r for st in plan.get("stages", []) for r in st.get("records") or []})
+        self.derived_fields: Dict[str, Dict[str, Any]] = plan.get("derived_fields") or {}
         self.agents = load_agents(self.run_dir)
         self._load_roles()
         personas_file = _read_json(os.path.join(self.run_dir, "personas.json"), {}) or {}
@@ -576,6 +583,66 @@ class RunEvidence:
             })
         return rows
 
+    def authoritative_documents(self) -> List[Dict[str, str]]:
+        """Full texts of the sources the experiment declared authoritative (e.g. Product Truth)"""
+        from .source_requirements import authoritative_texts
+
+        return authoritative_texts(self.source_requirements, self.sources)
+
+    def persona_stage_timeline(self, canonical_id: str) -> List[Dict[str, Any]]:
+        """
+        Private stage deliveries and completions of a persona (orchestration facts, not behaviour)
+
+        Each stage is listed once (earliest round over both platforms).
+        """
+        persona = self.persona_index.personas.get(canonical_id)
+        agent_ids = set((persona or {}).get("agent_ids", []))
+        timeline: Dict[tuple, Dict[str, Any]] = {}
+        for e in self.orchestration_events:
+            if e.get("event_type") not in ("private_instruction", "stage_completed"):
+                continue
+            try:
+                if int(e.get("agent_id")) not in agent_ids:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if e.get("event_type") == "private_instruction" and e.get("status", "delivered") != "delivered":
+                continue
+            kind = "delivered" if e["event_type"] == "private_instruction" else "completed"
+            key = (e.get("stage_id"), kind)
+            round_num = e.get("round", e.get("completed_round", 0)) or 0
+            if key not in timeline or round_num < timeline[key]["round"]:
+                timeline[key] = {
+                    "stage_id": e.get("stage_id"),
+                    "stage_name": e.get("stage_name") or e.get("stage_id"),
+                    "event": kind,
+                    "round": round_num,
+                    "records": list(e.get("records") or []) if kind == "delivered" else [],
+                }
+        return sorted(timeline.values(), key=lambda x: (x["round"], x["event"] != "delivered", x["stage_id"] or ""))
+
+    def first_encounter(self, canonical_id: str, terms: List[str]) -> Optional[Dict[str, Any]]:
+        """
+        Earliest action of a persona whose own text or reacted-to content contains a term
+
+        Only the persona's own agent-generated actions count (seen content enters the
+        log through the persona's reaction to it).
+        """
+        lowered = [t.lower() for t in terms or [] if t]
+        hits = [
+            a for a in self.persona_actions(canonical_id, behavioural_only=True)
+            if any(t in f"{a.get('content') or ''} {a.get('target') or ''}".lower() for t in lowered)
+        ]
+        return min(hits, key=lambda a: (a.get("round", 0), a["timestamp"], a["ref"])) if hits else None
+
+    def persona_records(self, canonical_id: str) -> Dict[str, int]:
+        """Orchestration labels recorded for a persona (e.g. EXPOSED) with the first round"""
+        records: Dict[str, int] = {}
+        for item in self.persona_stage_timeline(canonical_id):
+            for label in item["records"]:
+                records.setdefault(label, item["round"])
+        return records
+
     def platform_counts(self) -> Dict[str, int]:
         counts: Dict[str, int] = {}
         for a in self.actions:
@@ -788,6 +855,7 @@ class RunEvidence:
             "roles_note": self.roles_note,
             "metric_scope": CONSUMER_METRIC_SCOPE,
             "orchestration_events": self.orchestration_events,
+            "stage_timelines": {cid: self.persona_stage_timeline(cid) for cid in self.persona_index.personas},
             "sources_origin": self.sources_origin,
             "sources": self.source_manifest(),
             "stats": self.stats(),

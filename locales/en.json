@@ -801,14 +801,17 @@
       "not_mentioned": "Agent has not mentioned / seen",
       "mentioned": "Agent has mentioned / seen",
       "stage_completed": "After stage completed",
-      "stage_not_completed": "Stage not completed"
+      "stage_not_completed": "Stage not completed",
+      "authored_mentioned": "Agent itself wrote / searched",
+      "authored_not_mentioned": "Agent has not itself written / searched"
     },
     "completionTypes": {
       "on_delivery": "On delivery",
       "mentioned": "Agent mentions",
       "action_types": "Agent performs action type",
       "any_action": "Any own action",
-      "rounds_elapsed": "Rounds elapsed"
+      "rounds_elapsed": "Rounds elapsed",
+      "authored_mentioned": "Agent itself writes"
     },
     "addStage": "Add stage",
     "saveStages": "Save stages",
@@ -826,6 +829,9 @@
     "logAwaiting": "Waiting for the agent selection to be confirmed (nothing is prepared before that)",
     "logResume": "Preparation already running: following its progress",
     "logUnchanged": "Population unchanged: existing preparation kept",
-    "logPreparing": "Preparing {active} active agents ({total} graph entities)"
+    "logPreparing": "Preparing {active} active agents ({total} graph entities)",
+    "contextSections": "Product context sections: {ids}",
+    "contextChars": "Factual context: {count} chars",
+    "records": "Records: {labels}"
   }
 }

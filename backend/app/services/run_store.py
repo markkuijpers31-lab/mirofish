@@ -30,6 +30,7 @@ SNAPSHOT_FILES = (
     "agent_roster.json",
     "agent_selection.json",
     "experiment_plan.json",
+    "source_requirements.json",
 )
 
 
@@ -474,12 +475,25 @@ class RunStore:
 
         try:
             from .research_instructions import snapshot_run_plan
+            from .source_requirements import REQUIREMENTS_FILE, COVERAGE_FILE, check_coverage
+            from .research_instructions import _run_source_documents
 
             snapshot["experiment_plan"] = snapshot_run_plan(run_dir, simulation_id)
+            requirements_path = os.path.join(run_dir, REQUIREMENTS_FILE)
+            if os.path.exists(requirements_path):
+                with open(requirements_path, "r", encoding="utf-8") as f:
+                    coverage = check_coverage(json.load(f), _run_source_documents(run_dir))
+                with open(os.path.join(run_dir, COVERAGE_FILE), "w", encoding="utf-8") as f:
+                    json.dump(coverage, f, ensure_ascii=False, indent=2)
+                snapshot["source_coverage_ok"] = coverage["ok"]
+                if not coverage["ok"]:
+                    raise ValueError(f"required source sections missing: {coverage['missing']}")
         except Exception as e:
-            # Without a valid plan no private stage runs; never fall back to posting it
-            log.warning(f"Experiment plan not resolved: {e}")
-            snapshot["experiment_plan_error"] = str(e)
+            # A run never starts with an unresolved plan or incomplete required
+            # sources: it would silently drop private stages or authority.
+            log.warning(f"Run refused, experiment not resolvable: {e}")
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise ValueError(f"Experiment configuration invalid for a new run: {e}")
 
         record = RunRecord(
             run_id=run_id,

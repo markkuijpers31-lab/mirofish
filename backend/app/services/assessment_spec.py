@@ -111,7 +111,10 @@ def _funnel_only(fields: List[str]) -> List[str]:
 
 
 def _clean_field(text: str) -> str:
-    text = re.sub(r"[*_`]+", "", text).strip()
+    # Strip Markdown emphasis (*x*, `x`, _x_, __x__) but keep underscores inside
+    # identifiers such as NOT_DISCOVERED
+    text = re.sub(r"[*`]+", "", text)
+    text = re.sub(r"(?<!\w)_+|_+(?!\w)", "", text).strip()
     text = text.rstrip(":;,.").strip()
     return text
 

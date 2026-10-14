@@ -202,6 +202,14 @@ Grotesk', 'Noto Sans SC', monospace`. Palette: black/white + orange
   researcher_instruction` (events use `orchestration`). Only `agent_generated` is
   behavioural evidence; conversion metrics default to
   `evidence_role = target_consumer AND origin = agent_generated` (`RunEvidence.consumer_metrics`).
+- Required sources (`services/source_requirements.py`): a simulation may declare authoritative
+  documents with anchored sections (`## Pricing {#pricing}`) and required terms; `/prepare` and
+  `/start` refuse until covered. Reports pass authoritative documents in full; stage
+  `context_sections` pull verbatim sections into private stage context (not leak-guarded).
+- Stage plan extras: `authored_mentioned` / `authored_not_mentioned` conditions (own text only),
+  `records` (orchestration facts such as EXPOSED, decided from deliveries), `derived_fields`
+  (decided from the complete log), `seed_blocked_terms`. A saved stage reaching no agent, or a
+  missing context section, refuses the run. Assessment-brief documents never enter the graph.
 
 ## Ports / Proxy
 

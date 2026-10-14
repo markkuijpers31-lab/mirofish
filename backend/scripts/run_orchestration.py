@@ -32,6 +32,11 @@ PRIVATE_FRAME = (
     "[You stay completely free in how you respond: you may ignore it, look into it, try it or reject it, "
     "exactly as your own persona would. Act only through your normal social media behaviour.]"
 )
+CONTEXT_FRAME = (
+    "\n[Factual information you can rely on - public product documentation, not advice and not a "
+    "recommendation. Information that is not listed here may still exist; do not assume something "
+    "is missing just because it is not mentioned:]\n{context}"
+)
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 _INSTRUCTION_MARKERS_RE = re.compile(
@@ -93,13 +98,21 @@ def private_texts_for_run(config: Dict[str, Any], plan: Dict[str, Any]) -> List[
     return texts
 
 
-def safe_seed_posts(config: Dict[str, Any], private_texts: Iterable[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def safe_seed_posts(
+    config: Dict[str, Any], private_texts: Iterable[str], blocked_terms: Iterable[str] = ()
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Seed posts that may be published (last line of defence for older configs)
+
+    Args:
+        config: simulation_config.json
+        private_texts: Private instruction texts
+        blocked_terms: Terms seed posts may not contain (e.g. the product under test)
 
     Returns:
         (posts to publish, rejected posts with reason)
     """
+    blocked = [t.lower() for t in blocked_terms or [] if t]
     publish, rejected = [], []
     seen = set()
     for post in (config.get("event_config") or {}).get("initial_posts") or []:
@@ -111,7 +124,10 @@ def safe_seed_posts(config: Dict[str, Any], private_texts: Iterable[str]) -> Tup
             rejected.append({**post, "reason": "duplicate seed post"})
             continue
         seen.add(key)
-        if reproduces_private_text(content, private_texts):
+        hit = next((t for t in blocked if t in content.lower()), None)
+        if hit:
+            rejected.append({**post, "reason": f"mentions blocked term '{hit}'"})
+        elif reproduces_private_text(content, private_texts):
             rejected.append({**post, "reason": "reproduces a private research instruction"})
         elif _INSTRUCTION_MARKERS_RE.search(content) or _LEADING_ID_RE.match(content):
             rejected.append({**post, "reason": "reads like a research instruction"})
@@ -183,6 +199,18 @@ class StageScheduler:
             self.history.setdefault(aid, []).append({**a, "round": round_num})
         return self._check_completion(round_num)
 
+    def _authored(self, agent_id: int, since_round: int = -1) -> str:
+        """Text the agent itself wrote or searched for (its own agent-generated actions)"""
+        parts = []
+        for a in self.history.get(agent_id, []):
+            if a.get("round", 0) < since_round or a.get("origin", ORIGIN_AGENT_GENERATED) != ORIGIN_AGENT_GENERATED:
+                continue
+            args = a.get("action_args") or {}
+            for key in ("content", "query"):
+                if args.get(key):
+                    parts.append(str(args[key]))
+        return " ".join(parts).lower()
+
     def _texts(self, agent_id: int, since_round: int = -1) -> str:
         parts = []
         for a in self.history.get(agent_id, []):
@@ -209,6 +237,10 @@ class StageScheduler:
             return not self._mentions(self._texts(agent_id), cond.get("terms"))
         if ctype == "mentioned":
             return self._mentions(self._texts(agent_id), cond.get("terms"))
+        if ctype == "authored_mentioned":
+            return self._mentions(self._authored(agent_id), cond.get("terms"))
+        if ctype == "authored_not_mentioned":
+            return not self._mentions(self._authored(agent_id), cond.get("terms"))
         if ctype == "stage_completed":
             return (cond.get("stage_id"), agent_id) in self.completed
         if ctype == "stage_not_completed":
@@ -235,12 +267,18 @@ class StageScheduler:
                     continue
                 self.delivered[key] = round_num
                 instruction = stage.get("private_instruction") or ""
+                context = stage.get("context") or ""
+                framed = PRIVATE_FRAME.format(instruction=instruction)
+                if context:
+                    framed += CONTEXT_FRAME.format(context=context)
                 deliveries.append({
                     "stage_id": stage["id"],
                     "stage_name": stage.get("name") or stage["id"],
                     "agent_id": aid,
                     "instruction": instruction,
-                    "framed": PRIVATE_FRAME.format(instruction=instruction),
+                    "context_chars": len(context),
+                    "records": list(stage.get("records") or []),
+                    "framed": framed,
                 })
                 if (stage.get("completion") or {}).get("type", "on_delivery") == "on_delivery":
                     self.completed[key] = round_num
@@ -263,6 +301,8 @@ class StageScheduler:
                     done = any(a.get("action_type") in (comp.get("action_types") or []) for a in own)
                 elif ctype == "mentioned":
                     done = self._mentions(self._texts(aid, delivered_round), comp.get("terms"))
+                elif ctype == "authored_mentioned":
+                    done = self._mentions(self._authored(aid, delivered_round), comp.get("terms"))
                 elif ctype == "rounds_elapsed":
                     done = round_num - delivered_round >= int(comp.get("rounds", 1))
                 if done:
@@ -307,7 +347,7 @@ class RunOrchestrator:
                             if a.get("agent_id") is not None}
 
     def seed_posts(self) -> List[Dict[str, Any]]:
-        posts, rejected = safe_seed_posts(self.config, self.private_texts)
+        posts, rejected = safe_seed_posts(self.config, self.private_texts, self.plan.get("seed_blocked_terms"))
         if self.action_logger:
             for post in rejected:
                 self.action_logger.log_event(
@@ -337,6 +377,7 @@ class RunOrchestrator:
                     "private_instruction", round_num=round_num, origin=ORIGIN_RESEARCHER_INSTRUCTION,
                     agent_id=d["agent_id"], agent_name=self.agent_names.get(d["agent_id"]),
                     stage_id=d["stage_id"], stage_name=d["stage_name"], instruction=d["instruction"],
+                    context_chars=d["context_chars"], records=d["records"] or None,
                     delivery="agent_memory", status=status, error=error,
                 )
         return activated

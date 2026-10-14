@@ -395,6 +395,9 @@ def apply_selection_update(
         row["has_saved_decision"] = True
 
     for row in rows.values():
+        if row["simulation_role"] not in role_ids and not row["active"]:
+            # A context-only entity's (suggested) role carries no meaning: follow the catalog
+            row["simulation_role"] = _available_role(row["simulation_role"], catalog)
         if row["simulation_role"] not in role_ids:
             raise ValueError(
                 f"Entity '{row['name']}' uses simulation role '{row['simulation_role']}' "

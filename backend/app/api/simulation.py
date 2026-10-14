@@ -402,6 +402,77 @@ def save_experiment_plan(simulation_id: str):
         return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 
+@simulation_bp.route("/<simulation_id>/source-requirements", methods=["GET"])
+def get_source_requirements(simulation_id: str):
+    """
+    Required source coverage of this simulation and the current coverage matrix
+
+    Returns:
+        {"success": true, "data": {"requirements": {...} | null, "coverage": {"ok": bool,
+         "documents": [{"id", "label", "files", "ok", "sections": [{"id", "status", "missing_terms"}]}],
+         "missing": ["product_truth:pricing"]} | null}}
+    """
+    from ..services.source_requirements import SourceRequirementsStore, simulation_coverage
+
+    try:
+        state = SimulationManager().get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": t("api.simulationNotFound", id=simulation_id)}), 404
+        return jsonify({"success": True, "data": {
+            "requirements": SourceRequirementsStore.load(simulation_id),
+            "coverage": simulation_coverage(simulation_id, state.project_id),
+        }})
+    except Exception as e:
+        logger.error(f"Failed to get source requirements: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@simulation_bp.route("/<simulation_id>/source-requirements", methods=["PUT", "POST"])
+def save_source_requirements(simulation_id: str):
+    """
+    Define the authoritative sources an experiment needs (prepare/start refuse until covered)
+
+    Request (JSON):
+        {"documents": [{"id": "product_truth", "label": "Product Truth",
+                        "filename_pattern": "product[-_ ]?truth", "authoritative": true,
+                        "sections": [{"id": "pricing", "label": "Pricing",
+                                      "required_terms": ["Trip Pass"], "min_chars": 200}]}]}
+
+    Sections are Markdown headings with an explicit anchor, e.g. "## Pricing {#pricing}".
+
+    Returns:
+        {"success": true, "data": {"requirements": {...}, "coverage": {...}}}
+    """
+    from ..services.source_requirements import SourceRequirementsStore, simulation_coverage
+
+    try:
+        state = SimulationManager().get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": t("api.simulationNotFound", id=simulation_id)}), 404
+        try:
+            spec = SourceRequirementsStore.save(simulation_id, request.get_json() or {})
+        except ValueError as e:
+            return jsonify({"success": False, "error": str(e)}), 400
+        return jsonify({"success": True, "data": {
+            "requirements": spec,
+            "coverage": simulation_coverage(simulation_id, state.project_id),
+        }})
+    except Exception as e:
+        logger.error(f"Failed to save source requirements: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+def _coverage_refusal(simulation_id: str, project_id: str):
+    """400 response when required sources are incomplete, else None"""
+    from ..services.source_requirements import coverage_error, simulation_coverage
+
+    coverage = simulation_coverage(simulation_id, project_id)
+    error = coverage_error(coverage)
+    if error:
+        return jsonify({"success": False, "error": error, "source_coverage": coverage}), 400
+    return None
+
+
 # ============== Simulation management endpoints ==============
 
 
@@ -764,6 +835,11 @@ def prepare_simulation():
                 "error": t("api.agentSelectionRequired"),
                 "agent_selection_required": True,
             }), 400
+
+        # Required authoritative sources (e.g. a complete Product Truth) must be present
+        refusal = _coverage_refusal(simulation_id, state.project_id)
+        if refusal:
+            return refusal
 
         # Get required info from project
         project = ProjectManager.get_project(state.project_id)
@@ -1944,6 +2020,11 @@ def start_simulation():
                         "error": t("api.simNotReady", status=state.status.value),
                     }
                 ), 400
+
+            # ...and complete required sources (checked again when the run snapshots them)
+            refusal = _coverage_refusal(simulation_id, state.project_id)
+            if refusal:
+                return refusal
 
             previous_run_id = None
             if current is not None and new_run:

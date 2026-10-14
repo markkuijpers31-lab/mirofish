@@ -204,12 +204,17 @@
           <input v-model="s.personaIdsText" class="input" :placeholder="$t('agentSelection.personaIds')" :disabled="!planEditable" />
         </div>
         <textarea v-model="s.private_instruction" class="input textarea" rows="3" :placeholder="$t('agentSelection.privateInstruction')" :disabled="!planEditable"></textarea>
+        <p v-if="s.context_sections?.length || s.context || s.records?.length" class="stage-meta">
+          <span v-if="s.context_sections?.length">{{ $t('agentSelection.contextSections', { ids: s.context_sections.join(', ') }) }}</span>
+          <span v-if="s.context">{{ $t('agentSelection.contextChars', { count: s.context.length }) }}</span>
+          <span v-if="s.records?.length">{{ $t('agentSelection.records', { labels: s.records.join(', ') }) }}</span>
+        </p>
         <div class="stage-row">
           <span class="control-label">{{ $t('agentSelection.condition') }}</span>
           <select v-model="s.condition.type" class="input" :disabled="!planEditable">
             <option v-for="c in conditionTypes" :key="c" :value="c">{{ $t('agentSelection.conditionTypes.' + c) }}</option>
           </select>
-          <input v-if="['mentioned', 'not_mentioned'].includes(s.condition.type)" v-model="s.condition.termsText" class="input" :placeholder="$t('agentSelection.terms')" :disabled="!planEditable" />
+          <input v-if="['mentioned', 'not_mentioned', 'authored_mentioned', 'authored_not_mentioned'].includes(s.condition.type)" v-model="s.condition.termsText" class="input" :placeholder="$t('agentSelection.terms')" :disabled="!planEditable" />
           <select v-if="['stage_completed', 'stage_not_completed'].includes(s.condition.type)" v-model="s.condition.stage_id" class="input" :disabled="!planEditable">
             <option v-for="o in stages.filter(x => x !== s)" :key="o.id" :value="o.id">{{ o.name || o.id }}</option>
           </select>
@@ -217,7 +222,7 @@
           <select v-model="s.completion.type" class="input" :disabled="!planEditable">
             <option v-for="c in completionTypes" :key="c" :value="c">{{ $t('agentSelection.completionTypes.' + c) }}</option>
           </select>
-          <input v-if="s.completion.type === 'mentioned'" v-model="s.completion.termsText" class="input" :placeholder="$t('agentSelection.terms')" :disabled="!planEditable" />
+          <input v-if="['mentioned', 'authored_mentioned'].includes(s.completion.type)" v-model="s.completion.termsText" class="input" :placeholder="$t('agentSelection.terms')" :disabled="!planEditable" />
           <input v-if="s.completion.type === 'action_types'" v-model="s.completion.actionTypesText" class="input" placeholder="CREATE_POST, CREATE_COMMENT" :disabled="!planEditable" />
           <input v-if="s.completion.type === 'rounds_elapsed'" v-model.number="s.completion.rounds" type="number" min="1" class="input num" :disabled="!planEditable" />
         </div>
@@ -412,6 +417,10 @@ const savePlan = async () => {
         trigger_round: s.trigger_round,
         target: { ...s.target, persona_ids: splitList(s.personaIdsText) },
         private_instruction: s.private_instruction,
+        // Fields this editor does not edit are passed through unchanged
+        context: s.context || '',
+        context_sections: s.context_sections || [],
+        records: s.records || [],
         condition: {
           type: s.condition.type,
           terms: splitList(s.condition.termsText),
@@ -596,6 +605,7 @@ watch(() => props.simulationId, () => loadPlan(), { immediate: true })
 .stage-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 6px; }
 .inline-label, .check-label { font-size: 11px; color: #555; display: inline-flex; align-items: center; gap: 4px; }
 .plan-message { font-size: 11px; color: #2E7D32; }
+.stage-meta { font-size: 11px; color: #555; margin: 0 0 6px; display: flex; flex-wrap: wrap; gap: 10px; }
 .plan-message.error { color: #C62828; }
 
 .confirm-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }

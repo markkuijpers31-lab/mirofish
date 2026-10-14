@@ -404,3 +404,21 @@ def test_canonicalisation_groups_high_confidence_variants_and_flags_ambiguous_on
     # Product names with digits are not persona identifiers
     gpt = find_duplicates([{"uuid": "a", "name": "GPT4"}, {"uuid": "b", "name": "GPT4 Turbo"}])
     assert gpt["b"]["duplicate_of"] is None
+
+
+def test_custom_role_catalog_does_not_require_roles_for_context_entities(uploads, client):
+    sim_id, _ = _simulation(CONSUMERS[:2] + PLATFORMS[:2])
+    url = f"/api/simulation/{sim_id}/agent-selection"
+    rows = client.get(url).json["data"]["entities"]
+    first = rows[0]
+    catalog = [{"id": "prospect_cold", "label": "Prospect - cold", "default_evidence_role": "target_consumer"},
+               {"id": "other", "label": "Other"}]
+    saved = client.put(url, json={"role_catalog": catalog, "confirmed": True, "entities": [
+        {"entity_uuid": first["entity_uuid"], "active": True, "simulation_role": "prospect_cold"}]})
+    assert saved.status_code == 200, saved.json
+    inactive_roles = {e["simulation_role"] for e in saved.json["data"]["entities"] if not e["active"]}
+    assert inactive_roles == {"other"}
+    # An active agent still needs a role from the catalog
+    bad = client.put(url, json={"role_catalog": [{"id": "other", "label": "Other"}], "confirmed": True,
+                                "entities": [{"entity_uuid": first["entity_uuid"], "active": True}]})
+    assert bad.status_code == 400

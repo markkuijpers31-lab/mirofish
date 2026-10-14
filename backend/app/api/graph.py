@@ -391,8 +391,20 @@ def build_graph():
         project.chunk_size = chunk_size
         project.chunk_overlap = chunk_overlap
 
-        # Get extracted text
+        # Get extracted text. Assessment-brief documents are research design, not
+        # world knowledge: they never enter the graph (their persona IDs, tasks
+        # and product names would otherwise become facts about the agents).
         text = ProjectManager.get_extracted_text(project_id)
+        from ..services.research_instructions import split_brief_documents
+
+        brief_docs, context_docs = split_brief_documents(ProjectManager.get_source_documents(project_id))
+        if brief_docs and any(d.get("origin") == "per_file_text" for d in brief_docs):
+            text = "".join(
+                f"\n\n=== {d.get('original_filename')} ===\n{d.get('text') or ''}" for d in context_docs
+            )
+            logger.info(
+                f"Graph build excludes brief documents: {[d.get('original_filename') for d in brief_docs]}"
+            )
         if not text:
             return jsonify({"success": False, "error": t("api.textNotFound")}), 400
 
