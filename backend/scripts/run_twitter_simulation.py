@@ -39,7 +39,7 @@ sys.path.insert(0, _backend_dir)
 # Load the .env file from the project root (contains LLM_API_KEY and other settings)
 from dotenv import load_dotenv
 
-from run_orchestration import RunOrchestrator
+from run_orchestration import RunOrchestrator, resolve_total_rounds
 
 _env_file = os.path.join(_project_root, ".env")
 if os.path.exists(_env_file):
@@ -561,16 +561,10 @@ class TwitterSimulationRunner:
         minutes_per_round = time_config.get("minutes_per_round", 30)
 
         # Calculate total rounds
-        total_rounds = (total_hours * 60) // minutes_per_round
-
-        # Truncate if a max round count is specified
-        if max_rounds is not None and max_rounds > 0:
-            original_rounds = total_rounds
-            total_rounds = min(total_rounds, max_rounds)
-            if total_rounds < original_rounds:
-                print(
-                    f"\nRounds truncated: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})"
-                )
+        # Exactly the Run Contract's rounds for a contracted run; otherwise the
+        # generated time_config, truncated by max_rounds
+        total_rounds, rounds_source = resolve_total_rounds(self.config, self.simulation_dir, max_rounds)
+        print(f"\nRounds: {total_rounds} ({rounds_source})")
 
         print(f"\nSimulation parameters:")
         print(f"  - Total simulation duration: {total_hours} hours")
@@ -622,6 +616,8 @@ class TwitterSimulationRunner:
         # Seed posts are in-world content only; research instructions are
         # delivered privately per stage (see run_orchestration.py)
         orchestrator = RunOrchestrator(self.config, self.simulation_dir)
+        # Private instructions are stripped/withheld before OASIS persists public text
+        orchestrator.guard_platform(self.env.platform)
         initial_posts = orchestrator.seed_posts()
 
         if initial_posts:

@@ -72,7 +72,6 @@ import GraphPanel from '../components/GraphPanel.vue'
 import Step2EnvSetup from '../components/Step2EnvSetup.vue'
 import { getProject, getGraphData } from '../api/graph'
 import { getSimulation, getRunStatus } from '../api/simulation'
-import { requestSimulationStart } from '../store/pendingSimulationStart'
 import LanguageSwitcher from '../components/LanguageSwitcher.vue'
 import { useI18n } from 'vue-i18n'
 
@@ -172,9 +171,8 @@ const handleNextStep = (params = {}) => {
     routeParams.query = { maxRounds: params.maxRounds }
   }
   
-  // Explicit user action: allow Step 3 to start a run once
-  requestSimulationStart(currentSimulationId.value)
-
+  // Navigation only: Step 3 never starts a run on mount. The run starts from the
+  // explicit Start click in Step 3, after a fresh backend preflight.
   // Navigate to Step 3 page
   router.push(routeParams)
 }

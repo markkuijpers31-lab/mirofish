@@ -19,7 +19,7 @@
           <div class="platform-stats">
             <span class="stat">
               <span class="stat-label">ROUND</span>
-              <span class="stat-value mono">{{ runStatus.twitter_current_round || 0 }}<span class="stat-total">/{{ runStatus.total_rounds || maxRounds || '-' }}</span></span>
+              <span class="stat-value mono">{{ runStatus.twitter_current_round || 0 }}<span class="stat-total">/{{ runStatus.total_rounds || contractRounds || maxRounds || '-' }}</span></span>
             </span>
             <span class="stat">
               <span class="stat-label">TIME</span>
@@ -60,7 +60,7 @@
           <div class="platform-stats">
             <span class="stat">
               <span class="stat-label">ROUND</span>
-              <span class="stat-value mono">{{ runStatus.reddit_current_round || 0 }}<span class="stat-total">/{{ runStatus.total_rounds || maxRounds || '-' }}</span></span>
+              <span class="stat-value mono">{{ runStatus.reddit_current_round || 0 }}<span class="stat-total">/{{ runStatus.total_rounds || contractRounds || maxRounds || '-' }}</span></span>
             </span>
             <span class="stat">
               <span class="stat-label">TIME</span>
@@ -97,7 +97,7 @@
         <button
           v-if="phase === 0 && !currentRunId"
           class="action-btn primary"
-          :disabled="isStarting"
+          :disabled="isStarting || (contractMode && !startAllowed)"
           @click="handleStartClick"
         >
           {{ $t('step3.startSimulationBtn') }}
@@ -105,7 +105,7 @@
         <button
           v-if="currentRunId && phase === 2"
           class="action-btn secondary"
-          :disabled="isStarting || isGeneratingReport"
+          :disabled="isStarting || isGeneratingReport || (contractMode && !startAllowed)"
           @click="handleRestart"
         >
           {{ $t('step3.restartSimulationBtn') }}
@@ -120,6 +120,17 @@
           <span v-if="!isGeneratingReport" class="arrow-icon">→</span>
         </button>
       </div>
+    </div>
+
+    <!-- Run preflight (contracted simulations): Start is enabled only by the backend -->
+    <div v-if="contractMode && (!currentRunId || phase === 2)" class="preflight-strip">
+      <RunPreflightPanel
+        :preflight="preflight"
+        :error="preflightError"
+        :loading="preflightLoading"
+        compact
+        @refresh="loadPreflight"
+      />
     </div>
 
     <!-- Main Content: Dual Timeline -->
@@ -312,11 +323,13 @@ import {
   startSimulation,
   stopSimulation,
   getRunStatus,
-  getRunStatusDetail
+  getRunStatusDetail,
+  getPreflight,
 } from '../api/simulation'
 import { generateReport } from '../api/report'
-import { consumeSimulationStartRequest } from '../store/pendingSimulationStart'
+import RunPreflightPanel from './RunPreflightPanel.vue'
 import { decideStep3MountAction } from '../utils/runLifecycle'
+import { canStartRun, isContractMode, lockedRounds, preflightFetchState, startRequest } from '../utils/runContract'
 
 const { t } = useI18n()
 
@@ -348,6 +361,31 @@ const currentRunStatus = ref(null) // Persistent run status from the backend
 const allActions = ref([]) // All actions (incremental accumulation)
 const actionIds = ref(new Set()) // Action ID set for deduplication
 const scrollContainer = ref(null)
+
+// Run preflight (backend state; a failed fetch is never ready)
+const preflight = ref(null)
+const preflightError = ref(null)
+const preflightLoading = ref(false)
+const contractMode = computed(() => isContractMode(preflight.value))
+const contractRounds = computed(() => lockedRounds(preflight.value))
+const startAllowed = computed(() => canStartRun({ preflight: preflight.value, error: preflightError.value }))
+
+const loadPreflight = async () => {
+  preflightLoading.value = true
+  try {
+    const res = await getPreflight(props.simulationId)
+    const next = preflightFetchState({ data: res.data })
+    preflight.value = next.preflight
+    preflightError.value = next.error
+  } catch (err) {
+    const next = preflightFetchState({ error: err?.response?.data?.error || err })
+    preflight.value = next.preflight
+    preflightError.value = next.error
+  } finally {
+    preflightLoading.value = false
+  }
+  return preflight.value
+}
 
 // Computed
 // Show actions in chronological order (newest at bottom)
@@ -436,11 +474,19 @@ const showFinishedRun = (data) => {
   emit('update-status', data.run_status === 'failed' ? 'error' : 'completed')
 }
 
-// Start a simulation run. Only called from an explicit user action
-// (Step 2 start click, Start button, or confirmed Restart).
+// Start a simulation run. Only called from an explicit user action in Step 3
+// (Start button or confirmed Restart), after a fresh backend preflight. The
+// backend re-runs the same preflight under the simulation lock before any run exists.
 const doStartSimulation = async ({ newRun = false } = {}) => {
   if (!props.simulationId) {
     addLog(t('log.errorMissingSimId'))
+    return
+  }
+
+  const fresh = await loadPreflight()
+  if (!canStartRun({ preflight: fresh, error: preflightError.value })) {
+    startError.value = preflightError.value || (fresh?.errors || []).join('; ') || 'Run preflight is not ready'
+    addLog(t('runContract.logStartRefused', { error: startError.value }))
     return
   }
 
@@ -453,19 +499,14 @@ const doStartSimulation = async ({ newRun = false } = {}) => {
   emit('update-status', 'processing')
   
   try {
-    const params = {
-      simulation_id: props.simulationId,
-      platform: 'parallel',
+    // A contracted run sends neither rounds nor platform: the contract decides
+    const params = startRequest(props.simulationId, preflight.value, { maxRounds: props.maxRounds, newRun })
+    if (params.max_rounds) {
+      addLog(t('log.setMaxRounds', { rounds: params.max_rounds }))
+    } else if (contractMode.value) {
+      addLog(t('runContract.roundsLocked', { rounds: contractRounds.value }))
     }
-    if (newRun) {
-      params.new_run = true
-    }
-    
-    if (props.maxRounds) {
-      params.max_rounds = props.maxRounds
-      addLog(t('log.setMaxRounds', { rounds: props.maxRounds }))
-    }
-    
+
     const res = await startSimulation(params)
     
     if (res.success && res.data) {
@@ -498,8 +539,9 @@ const doStartSimulation = async ({ newRun = false } = {}) => {
       emit('update-status', 'error')
     }
   } catch (err) {
-    startError.value = err.message
-    addLog(t('log.startException', { error: err.message }))
+    startError.value = err?.response?.data?.error || err.message
+    addLog(t('log.startException', { error: startError.value }))
+    if (err?.response?.data?.preflight) preflight.value = err.response.data.preflight
     emit('update-status', 'error')
   } finally {
     isStarting.value = false
@@ -777,14 +819,13 @@ watch(() => props.systemLogs?.length, () => {
   })
 })
 
-// Mounting (navigation, reload, back button) never starts or restarts a run:
-// it reads the persistent run state and only starts when the user explicitly
-// clicked "Start" in Step 2 right before.
+// Mounting (navigation from Step 2, reload, back/forward) never starts or
+// restarts a run: it reads the persistent run state and the preflight only.
 onMounted(async () => {
   addLog(t('log.step3Init'))
   if (!props.simulationId) return
 
-  const pendingStart = consumeSimulationStartRequest(props.simulationId)
+  loadPreflight()
   let data = null
   try {
     const res = await getRunStatus(props.simulationId)
@@ -796,15 +837,12 @@ onMounted(async () => {
 
   const action = decideStep3MountAction({
     runStatus: data?.run_id ? data.run_status : undefined,
-    pendingStart,
   })
   if (action === 'attach') {
     addLog(t('log.attachedToRunningRun', { runId: data.run_id }))
     attachToRun(data)
   } else if (action === 'show_finished') {
     showFinishedRun(data)
-  } else if (action === 'start') {
-    doStartSimulation()
   } else {
     addLog(t('log.noRunYet'))
   }
@@ -824,6 +862,8 @@ onUnmounted(() => {
   font-family: 'Space Grotesk', 'Noto Sans SC', system-ui, sans-serif;
   overflow: hidden;
 }
+
+.preflight-strip { padding: 10px 20px; border-bottom: 1px solid #EAEAEA; max-height: 45vh; overflow-y: auto; }
 
 /* --- Control Bar --- */
 .control-bar {

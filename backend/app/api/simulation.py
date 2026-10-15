@@ -18,6 +18,8 @@ from ..services.oasis_profile_generator import OasisProfileGenerator
 from ..services.simulation_manager import SimulationManager, SimulationStatus
 from ..services.simulation_runner import SimulationRunner, RunnerStatus
 from ..services.run_store import RunStatus, RunStore
+from ..services.run_contract import RunContractStore, apply_contract, project_has_contract
+from ..services.run_preflight import RunContractPreflight
 from ..utils.logger import get_logger, get_run_logger
 from ..utils.locale import t, get_locale, set_locale
 from ..models.project import ProjectManager
@@ -212,8 +214,30 @@ def _selection_response(simulation_id: str, state, saved: Optional[Dict[str, Any
         "graph_id": state.graph_id,
         "population": _population_status(simulation_id, state, saved),
         "brief_instructions_count": len(brief.get("instructions", [])),
+        "contract": _contract_lock_info(simulation_id, state),
     })
     return view
+
+
+CONTRACT_LOCKED_MESSAGE = "Locked by Run Contract: population, stages, source requirements and rounds come from the contract"
+
+
+def _contract_locked(state) -> bool:
+    """Whether the simulation's project carries a Run Contract (valid or not)"""
+    return project_has_contract(state.project_id)
+
+
+def _contract_lock_info(simulation_id: str, state) -> Dict[str, Any]:
+    applied = RunContractStore.load(simulation_id) or {}
+    return {
+        "locked": _contract_locked(state),
+        "applied_contract_id": applied.get("contract_id"),
+        "applied_contract_hash": applied.get("contract_hash"),
+    }
+
+
+def _contract_locked_response():
+    return jsonify({"success": False, "error": CONTRACT_LOCKED_MESSAGE, "locked_by_contract": True}), 409
 
 
 def _save_selection(simulation_id: str, state, payload: Dict[str, Any], confirmed_default: bool = False) -> Dict[str, Any]:
@@ -310,6 +334,8 @@ def save_agent_selection(simulation_id: str):
         state = SimulationManager().get_simulation(simulation_id)
         if not state:
             return jsonify({"success": False, "error": t("api.simulationNotFound", id=simulation_id)}), 404
+        if _contract_locked(state):
+            return _contract_locked_response()
         try:
             result = _save_selection(simulation_id, state, request.get_json() or {})
         except ValueError as e:
@@ -345,11 +371,18 @@ def get_experiment_plan(simulation_id: str):
         if not state:
             return jsonify({"success": False, "error": t("api.simulationNotFound", id=simulation_id)}), 404
         plan = ExperimentPlanStore.load(simulation_id)
-        if plan is None:
+        locked = _contract_locked(state)
+        if locked:
+            # The Run Contract owns the stages: never derive them from brief prose
+            applied = RunContractStore.load(simulation_id) or {}
+            if plan is None or plan.get("contract_hash") != applied.get("contract_hash"):
+                plan = {"stages": [], "saved": False}
+        elif plan is None:
             brief = load_project_brief(state.project_id)
             plan = plan_from_brief(brief["brief_text"], brief["persona_ids"])
         return jsonify({"success": True, "data": {
             **plan,
+            "locked_by_contract": locked,
             "condition_types": list(CONDITION_TYPES),
             "completion_types": list(COMPLETION_TYPES),
         }})
@@ -387,6 +420,8 @@ def save_experiment_plan(simulation_id: str):
         state = SimulationManager().get_simulation(simulation_id)
         if not state:
             return jsonify({"success": False, "error": t("api.simulationNotFound", id=simulation_id)}), 404
+        if _contract_locked(state):
+            return _contract_locked_response()
         selection = AgentSelectionStore.load(simulation_id) or {}
         catalog = selection.get("role_catalog") or DEFAULT_ROLE_CATALOG
         try:
@@ -449,6 +484,8 @@ def save_source_requirements(simulation_id: str):
         state = SimulationManager().get_simulation(simulation_id)
         if not state:
             return jsonify({"success": False, "error": t("api.simulationNotFound", id=simulation_id)}), 404
+        if _contract_locked(state):
+            return _contract_locked_response()
         try:
             spec = SourceRequirementsStore.save(simulation_id, request.get_json() or {})
         except ValueError as e:
@@ -460,6 +497,99 @@ def save_source_requirements(simulation_id: str):
     except Exception as e:
         logger.error(f"Failed to save source requirements: {str(e)}")
         return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@simulation_bp.route("/<simulation_id>/preflight", methods=["GET"])
+def get_preflight(simulation_id: str):
+    """
+    Run preflight: the persisted configuration checked against the project's Run Contract
+
+    Query parameters:
+        max_rounds, platform: optional values of a planned start request
+
+    Returns:
+        {"success": true, "data": {
+            "mode": "contract" | "standard",
+            "contract": {"present", "id", "schema", "hash", "valid", "applied", "errors"},
+            "population": {"expected", "resolved", "active", "missing_persona_ids",
+                           "duplicate_persona_ids", "unexpected_active", "role_mismatches",
+                           "evidence_role_mismatches", "entities": [...], "ok"},
+            "roles": {"target_consumers", "influencer_context", "excluded_active", "ok"},
+            "experiment_plan": {"expected_stages", "saved_stages", "mismatches",
+                                "unresolved_stage_targets", "ok"},
+            "rounds": {"expected", "ok"},
+            "sources": {"requirements_present", "coverage_ok", "missing", "documents", "ok"},
+            "preparation": {"prepared", "selection_hash_matches", "roster_matches_contract",
+                            "profile_count_twitter", "profile_count_reddit",
+                            "profile_persona_ids_match", "config_agent_count", "ok"},
+            "ready_to_prepare": bool, "ready_to_start": bool, "errors": [...],
+            "fingerprint": "..."}}
+        For simulations without a Run Contract: mode="standard", contract.present=false.
+    """
+    try:
+        requested = {}
+        if request.args.get("max_rounds") not in (None, ""):
+            try:
+                requested["max_rounds"] = int(request.args["max_rounds"])
+            except ValueError:
+                return jsonify({"success": False, "error": t("api.maxRoundsInvalid")}), 400
+        if request.args.get("platform"):
+            requested["platform"] = request.args["platform"]
+        try:
+            data = RunContractPreflight.evaluate(simulation_id, requested)
+        except ValueError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+        return jsonify({"success": True, "data": data})
+    except Exception as e:
+        logger.error(f"Failed to evaluate preflight: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@simulation_bp.route("/<simulation_id>/run-contract/apply", methods=["POST"])
+def apply_run_contract(simulation_id: str):
+    """
+    Apply the project's Run Contract to the simulation (deterministic, never calls an LLM)
+
+    Persists agent_selection.json (contract personas active with the contract roles,
+    every other graph entity context-only; confirmed only when every persona id
+    resolved to exactly one graph entity), experiment_plan.json,
+    source_requirements.json and run_contract.json, then returns the preflight.
+    Preparation is never started.
+
+    Returns:
+        {"success": true, "data": {"applied": true, "confirmed": bool,
+         "preparation_invalidated": bool, "errors": [...], "preflight": {...}}}
+    """
+    try:
+        state = SimulationManager().get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": t("api.simulationNotFound", id=simulation_id)}), 404
+        with RunStore.lock(simulation_id):
+            if _prepare_task_running(state):
+                return jsonify({"success": False, "error": "Preparation is in progress; wait for it to finish"}), 409
+            if _active_run_exists(simulation_id):
+                return jsonify({"success": False, "error": "A run is executing; stop it before applying the Run Contract"}), 409
+            try:
+                result = apply_contract(simulation_id)
+            except ValueError as e:
+                return jsonify({"success": False, "error": str(e),
+                                "preflight": RunContractPreflight.evaluate(simulation_id)}), 400
+            result["preflight"] = RunContractPreflight.evaluate(simulation_id)
+        return jsonify({"success": True, "data": result})
+    except Exception as e:
+        logger.error(f"Failed to apply run contract: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+def _preflight_refusal(preflight: Dict[str, Any], action: str):
+    """400 response carrying the complete preflight"""
+    errors = preflight.get("errors") or ["preflight failed"]
+    return jsonify({
+        "success": False,
+        "error": f"Run preflight failed, {action} refused: " + "; ".join(errors[:12])
+        + (f" (+{len(errors) - 12} more)" if len(errors) > 12 else ""),
+        "preflight": preflight,
+    }), 400
 
 
 def _coverage_refusal(simulation_id: str, project_id: str):
@@ -748,11 +878,6 @@ def prepare_simulation():
             }
         }
     """
-    import threading
-    import os
-    from ..models.task import TaskManager, TaskStatus
-    from ..config import Config
-
     try:
         data = request.get_json() or {}
 
@@ -762,283 +887,10 @@ def prepare_simulation():
                 {"success": False, "error": t("api.requireSimulationId")}
             ), 400
 
-        manager = SimulationManager()
-        state = manager.get_simulation(simulation_id)
-
-        if not state:
-            return jsonify(
-                {
-                    "success": False,
-                    "error": t("api.simulationNotFound", id=simulation_id),
-                }
-            ), 404
-
-        # An explicit selection in the request is saved (and confirmed) first
-        if data.get("agent_selection") is not None:
-            try:
-                _save_selection(simulation_id, state, data["agent_selection"], confirmed_default=True)
-            except ValueError as e:
-                return jsonify({"success": False, "error": str(e)}), 400
-            except RuntimeError as e:
-                return jsonify({"success": False, "error": str(e)}), 409
-            state = manager.get_simulation(simulation_id)
-
-        # A running preparation is attached to, never duplicated (reload-safe)
-        if _prepare_task_running(state):
-            return jsonify({"success": True, "data": {
-                "simulation_id": simulation_id,
-                "task_id": state.prepare_task_id,
-                "status": "preparing",
-                "message": t("api.prepareStarted"),
-                "already_prepared": False,
-                "already_running": True,
-                "expected_entities_count": state.active_agents_count,
-                "graph_entities_count": state.entities_count,
-            }})
-
-        # Check if force regenerate
-        force_regenerate = data.get("force_regenerate", False)
-        logger.info(
-            f"Processing /prepare request: simulation_id={simulation_id}, force_regenerate={force_regenerate}"
-        )
-
-        # Check if already prepared (avoid duplicate generation)
-        if not force_regenerate:
-            logger.debug(f"Checking simulation {simulation_id}  is already prepared...")
-            is_prepared, prepare_info = _check_simulation_prepared(simulation_id)
-            logger.debug(
-                f"Check result: is_prepared={is_prepared}, prepare_info={prepare_info}"
-            )
-            if is_prepared:
-                logger.info(f"Simulation {simulation_id} already prepared, skipping duplicate generation")
-                return jsonify(
-                    {
-                        "success": True,
-                        "data": {
-                            "simulation_id": simulation_id,
-                            "status": "ready",
-                            "message": t("api.alreadyPrepared"),
-                            "already_prepared": True,
-                            "prepare_info": prepare_info,
-                        },
-                    }
-                )
-            else:
-                logger.info(f"Simulation {simulation_id} not prepared, will start preparation task")
-
-        # The population must be chosen explicitly: graph entity != agent
-        selection = AgentSelectionStore.load(simulation_id)
-        active_selected = sum(1 for e in (selection or {}).get("entities", []) if e.get("active"))
-        if not selection or not selection.get("confirmed") or active_selected == 0:
-            return jsonify({
-                "success": False,
-                "error": t("api.agentSelectionRequired"),
-                "agent_selection_required": True,
-            }), 400
-
-        # Required authoritative sources (e.g. a complete Product Truth) must be present
-        refusal = _coverage_refusal(simulation_id, state.project_id)
-        if refusal:
-            return refusal
-
-        # Get required info from project
-        project = ProjectManager.get_project(state.project_id)
-        if not project:
-            return jsonify(
-                {
-                    "success": False,
-                    "error": t("api.projectNotFound", id=state.project_id),
-                }
-            ), 404
-
-        # Get simulation requirement
-        simulation_requirement = project.simulation_requirement or ""
-        if not simulation_requirement:
-            return jsonify(
-                {"success": False, "error": t("api.projectMissingRequirement")}
-            ), 400
-
-        # Context documents only: the assessment brief is research design, never
-        # simulation content (its instructions are delivered privately per run)
-        from ..services.research_instructions import load_project_brief
-
-        brief = load_project_brief(state.project_id)
-        document_text = brief["context_text"]
-
-        entity_types_list = data.get("entity_types")
-        use_llm_for_profiles = data.get("use_llm_for_profiles", True)
-        parallel_profile_count = data.get("parallel_profile_count", 5)
-
-        # ========== Synchronously get entity count (before background task starts) ==========
-        # So frontend can immediately get expected Agent total after calling prepare
-        try:
-            logger.info(f"Synchronously getting entity count: graph_id={state.graph_id}")
-            reader = EntityReader()
-            # Quick entity read (no edge info needed, just count)
-            filtered_preview = reader.filter_defined_entities(
-                graph_id=state.graph_id,
-                defined_entity_types=entity_types_list,
-                enrich_with_edges=False,  # Don't fetch edge info, speed up
-            )
-            # Save entity count to state (for frontend immediate access)
-            state.entities_count = filtered_preview.filtered_count
-            state.entity_types = list(filtered_preview.entity_types)
-            state.active_agents_count = active_selected
-            state.context_entities_count = max(filtered_preview.filtered_count - active_selected, 0)
-            logger.info(
-                f"Population: {active_selected} active agents / {filtered_preview.filtered_count} graph entities, "
-                f"types: {filtered_preview.entity_types}"
-            )
-        except Exception as e:
-            logger.warning(f"Synchronously getting entity count failed (will retry in background task): {e}")
-            # Failure doesn't affect subsequent flow, background task will retry
-
-        # Create async task
-        task_manager = TaskManager()
-        task_id = task_manager.create_task(
-            task_type="simulation_prepare",
-            metadata={"simulation_id": simulation_id, "project_id": state.project_id},
-        )
-
-        # Update simulation state (including pre-fetched entity count). The
-        # previous preparation is invalid until the new one completes.
-        state.status = SimulationStatus.PREPARING
-        state.profiles_generated = False
-        state.config_generated = False
-        state.error = None
-        state.prepare_task_id = task_id
-        manager._save_simulation_state(state)
-
-        # Capture locale before spawning background thread
-        current_locale = get_locale()
-
-        # Define background task
-        def run_prepare():
-            set_locale(current_locale)
-            try:
-                task_manager.update_task(
-                    task_id,
-                    status=TaskStatus.PROCESSING,
-                    progress=0,
-                    message=t("progress.startPreparingEnv"),
-                )
-
-                # Prepare simulation (with progress callback)
-                # Store phase progress details
-                stage_details = {}
-
-                def progress_callback(stage, progress, message, **kwargs):
-                    # Calculate total progress
-                    stage_weights = {
-                        "reading": (0, 20),  # 0-20%
-                        "generating_profiles": (20, 70),  # 20-70%
-                        "generating_config": (70, 90),  # 70-90%
-                        "copying_scripts": (90, 100),  # 90-100%
-                    }
-
-                    start, end = stage_weights.get(stage, (0, 100))
-                    current_progress = int(start + (end - start) * progress / 100)
-
-                    # Build detailed progress info
-                    stage_names = {
-                        "reading": t("progress.readingGraphEntities"),
-                        "generating_profiles": t("progress.generatingProfiles"),
-                        "generating_config": t("progress.generatingSimConfig"),
-                        "copying_scripts": t("progress.preparingScripts"),
-                    }
-
-                    stage_index = (
-                        list(stage_weights.keys()).index(stage) + 1
-                        if stage in stage_weights
-                        else 1
-                    )
-                    total_stages = len(stage_weights)
-
-                    # Update phase details
-                    stage_details[stage] = {
-                        "stage_name": stage_names.get(stage, stage),
-                        "stage_progress": progress,
-                        "current": kwargs.get("current", 0),
-                        "total": kwargs.get("total", 0),
-                        "item_name": kwargs.get("item_name", ""),
-                    }
-
-                    # Build detailed progress info
-                    detail = stage_details[stage]
-                    progress_detail_data = {
-                        "current_stage": stage,
-                        "current_stage_name": stage_names.get(stage, stage),
-                        "stage_index": stage_index,
-                        "total_stages": total_stages,
-                        "stage_progress": progress,
-                        "current_item": detail["current"],
-                        "total_items": detail["total"],
-                        "item_description": message,
-                    }
-
-                    # Build concise message
-                    if detail["total"] > 0:
-                        detailed_message = (
-                            f"[{stage_index}/{total_stages}] {stage_names.get(stage, stage)}: "
-                            f"{detail['current']}/{detail['total']} - {message}"
-                        )
-                    else:
-                        detailed_message = f"[{stage_index}/{total_stages}] {stage_names.get(stage, stage)}: {message}"
-
-                    task_manager.update_task(
-                        task_id,
-                        progress=current_progress,
-                        message=detailed_message,
-                        progress_detail=progress_detail_data,
-                    )
-
-                result_state = manager.prepare_simulation(
-                    simulation_id=simulation_id,
-                    simulation_requirement=simulation_requirement,
-                    document_text=document_text,
-                    defined_entity_types=entity_types_list,
-                    use_llm_for_profiles=use_llm_for_profiles,
-                    progress_callback=progress_callback,
-                    parallel_profile_count=parallel_profile_count,
-                    brief=brief,
-                )
-
-                # Task complete
-                task_manager.complete_task(
-                    task_id, result=result_state.to_simple_dict()
-                )
-
-            except Exception as e:
-                logger.error(f"Simulation preparation failed: {str(e)}")
-                task_manager.fail_task(task_id, str(e))
-
-                # Update simulation state to failed
-                state = manager.get_simulation(simulation_id)
-                if state:
-                    state.status = SimulationStatus.FAILED
-                    state.error = str(e)
-                    manager._save_simulation_state(state)
-
-        # Start background thread
-        thread = threading.Thread(target=run_prepare, daemon=True)
-        thread.start()
-
-        return jsonify(
-            {
-                "success": True,
-                "data": {
-                    "simulation_id": simulation_id,
-                    "task_id": task_id,
-                    "status": "preparing",
-                    "message": t("api.prepareStarted"),
-                    "already_prepared": False,
-                    "expected_entities_count": state.active_agents_count,  # Expected Agent total (active only)
-                    "graph_entities_count": state.entities_count,
-                    "context_entities_count": state.context_entities_count,
-                    "entity_types": state.entity_types,  # Entity type list
-                },
-            }
-        )
+        # Check-and-set of the preparation runs under the simulation lock, so a
+        # start can never snapshot files a new preparation is rewriting
+        with RunStore.lock(simulation_id):
+            return _prepare_locked(data, simulation_id)
 
     except ValueError as e:
         return jsonify({"success": False, "error": str(e)}), 404
@@ -1048,6 +900,323 @@ def prepare_simulation():
         return jsonify(
             {"success": False, "error": str(e), "traceback": traceback.format_exc()}
         ), 500
+
+
+def _prepare_locked(data: Dict[str, Any], simulation_id: str):
+    """Body of POST /prepare (caller holds RunStore.lock(simulation_id))"""
+    import threading
+    from ..models.task import TaskManager, TaskStatus
+
+    manager = SimulationManager()
+    state = manager.get_simulation(simulation_id)
+
+    if not state:
+        return jsonify(
+            {
+                "success": False,
+                "error": t("api.simulationNotFound", id=simulation_id),
+            }
+        ), 404
+
+    # A Run Contract owns the population: no selection may come with the request
+    contract_mode = _contract_locked(state)
+    if contract_mode and data.get("agent_selection") is not None:
+        return _contract_locked_response()
+
+    # An explicit selection in the request is saved (and confirmed) first
+    if data.get("agent_selection") is not None:
+        try:
+            _save_selection(simulation_id, state, data["agent_selection"], confirmed_default=True)
+        except ValueError as e:
+            return jsonify({"success": False, "error": str(e)}), 400
+        except RuntimeError as e:
+            return jsonify({"success": False, "error": str(e)}), 409
+        state = manager.get_simulation(simulation_id)
+
+    # A running preparation is attached to, never duplicated (reload-safe)
+    if _prepare_task_running(state):
+        return jsonify({"success": True, "data": {
+            "simulation_id": simulation_id,
+            "task_id": state.prepare_task_id,
+            "status": "preparing",
+            "message": t("api.prepareStarted"),
+            "already_prepared": False,
+            "already_running": True,
+            "expected_entities_count": state.active_agents_count,
+            "graph_entities_count": state.entities_count,
+        }})
+
+    # Check if force regenerate
+    force_regenerate = data.get("force_regenerate", False)
+    logger.info(
+        f"Processing /prepare request: simulation_id={simulation_id}, force_regenerate={force_regenerate}"
+    )
+
+    # Contracted simulation: the backend preflight decides, before any task exists
+    preflight = RunContractPreflight.evaluate(simulation_id) if contract_mode else None
+    if contract_mode and not force_regenerate and preflight["ready_to_start"]:
+        return jsonify({"success": True, "data": {
+            "simulation_id": simulation_id,
+            "status": "ready",
+            "message": t("api.alreadyPrepared"),
+            "already_prepared": True,
+            "preflight": preflight,
+        }})
+    if contract_mode and not preflight["ready_to_prepare"]:
+        get_logger("mirofish.api.simulation").warning(
+            f"[{simulation_id}] Prepare refused by run preflight: {preflight['errors']}"
+        )
+        return _preflight_refusal(preflight, "preparation")
+
+    # Check if already prepared (avoid duplicate generation)
+    if not force_regenerate and not contract_mode:
+        logger.debug(f"Checking simulation {simulation_id}  is already prepared...")
+        is_prepared, prepare_info = _check_simulation_prepared(simulation_id)
+        logger.debug(
+            f"Check result: is_prepared={is_prepared}, prepare_info={prepare_info}"
+        )
+        if is_prepared:
+            logger.info(f"Simulation {simulation_id} already prepared, skipping duplicate generation")
+            return jsonify(
+                {
+                    "success": True,
+                    "data": {
+                        "simulation_id": simulation_id,
+                        "status": "ready",
+                        "message": t("api.alreadyPrepared"),
+                        "already_prepared": True,
+                        "prepare_info": prepare_info,
+                    },
+                }
+            )
+        else:
+            logger.info(f"Simulation {simulation_id} not prepared, will start preparation task")
+
+    # The population must be chosen explicitly: graph entity != agent
+    selection = AgentSelectionStore.load(simulation_id)
+    active_selected = sum(1 for e in (selection or {}).get("entities", []) if e.get("active"))
+    if not selection or not selection.get("confirmed") or active_selected == 0:
+        return jsonify({
+            "success": False,
+            "error": t("api.agentSelectionRequired"),
+            "agent_selection_required": True,
+        }), 400
+
+    # Required authoritative sources (e.g. a complete Product Truth) must be present
+    refusal = _coverage_refusal(simulation_id, state.project_id)
+    if refusal:
+        return refusal
+
+    # Get required info from project
+    project = ProjectManager.get_project(state.project_id)
+    if not project:
+        return jsonify(
+            {
+                "success": False,
+                "error": t("api.projectNotFound", id=state.project_id),
+            }
+        ), 404
+
+    # Get simulation requirement
+    simulation_requirement = project.simulation_requirement or ""
+    if not simulation_requirement:
+        return jsonify(
+            {"success": False, "error": t("api.projectMissingRequirement")}
+        ), 400
+
+    # Context documents only: the assessment brief is research design, never
+    # simulation content (its instructions are delivered privately per run)
+    from ..services.research_instructions import load_project_brief
+
+    brief = load_project_brief(state.project_id)
+    document_text = brief["context_text"]
+
+    # A contracted population is never narrowed by entity types
+    entity_types_list = None if contract_mode else data.get("entity_types")
+    use_llm_for_profiles = data.get("use_llm_for_profiles", True)
+    parallel_profile_count = data.get("parallel_profile_count", 5)
+
+    # ========== Synchronously get entity count (before background task starts) ==========
+    # So frontend can immediately get expected Agent total after calling prepare
+    try:
+        logger.info(f"Synchronously getting entity count: graph_id={state.graph_id}")
+        reader = EntityReader()
+        # Quick entity read (no edge info needed, just count)
+        filtered_preview = reader.filter_defined_entities(
+            graph_id=state.graph_id,
+            defined_entity_types=entity_types_list,
+            enrich_with_edges=False,  # Don't fetch edge info, speed up
+        )
+        # Save entity count to state (for frontend immediate access)
+        state.entities_count = filtered_preview.filtered_count
+        state.entity_types = list(filtered_preview.entity_types)
+        state.active_agents_count = active_selected
+        state.context_entities_count = max(filtered_preview.filtered_count - active_selected, 0)
+        logger.info(
+            f"Population: {active_selected} active agents / {filtered_preview.filtered_count} graph entities, "
+            f"types: {filtered_preview.entity_types}"
+        )
+    except Exception as e:
+        logger.warning(f"Synchronously getting entity count failed (will retry in background task): {e}")
+        # Failure doesn't affect subsequent flow, background task will retry
+
+    # Create async task
+    task_manager = TaskManager()
+    task_id = task_manager.create_task(
+        task_type="simulation_prepare",
+        metadata={"simulation_id": simulation_id, "project_id": state.project_id},
+    )
+
+    # Update simulation state (including pre-fetched entity count). The
+    # previous preparation is invalid until the new one completes.
+    state.status = SimulationStatus.PREPARING
+    state.profiles_generated = False
+    state.config_generated = False
+    state.error = None
+    state.prepare_task_id = task_id
+    manager._save_simulation_state(state)
+
+    # Capture locale before spawning background thread
+    current_locale = get_locale()
+
+    # Define background task
+    def run_prepare():
+        set_locale(current_locale)
+        try:
+            task_manager.update_task(
+                task_id,
+                status=TaskStatus.PROCESSING,
+                progress=0,
+                message=t("progress.startPreparingEnv"),
+            )
+
+            # Prepare simulation (with progress callback)
+            # Store phase progress details
+            stage_details = {}
+
+            def progress_callback(stage, progress, message, **kwargs):
+                # Calculate total progress
+                stage_weights = {
+                    "reading": (0, 20),  # 0-20%
+                    "generating_profiles": (20, 70),  # 20-70%
+                    "generating_config": (70, 90),  # 70-90%
+                    "copying_scripts": (90, 100),  # 90-100%
+                }
+
+                start, end = stage_weights.get(stage, (0, 100))
+                current_progress = int(start + (end - start) * progress / 100)
+
+                # Build detailed progress info
+                stage_names = {
+                    "reading": t("progress.readingGraphEntities"),
+                    "generating_profiles": t("progress.generatingProfiles"),
+                    "generating_config": t("progress.generatingSimConfig"),
+                    "copying_scripts": t("progress.preparingScripts"),
+                }
+
+                stage_index = (
+                    list(stage_weights.keys()).index(stage) + 1
+                    if stage in stage_weights
+                    else 1
+                )
+                total_stages = len(stage_weights)
+
+                # Update phase details
+                stage_details[stage] = {
+                    "stage_name": stage_names.get(stage, stage),
+                    "stage_progress": progress,
+                    "current": kwargs.get("current", 0),
+                    "total": kwargs.get("total", 0),
+                    "item_name": kwargs.get("item_name", ""),
+                }
+
+                # Build detailed progress info
+                detail = stage_details[stage]
+                progress_detail_data = {
+                    "current_stage": stage,
+                    "current_stage_name": stage_names.get(stage, stage),
+                    "stage_index": stage_index,
+                    "total_stages": total_stages,
+                    "stage_progress": progress,
+                    "current_item": detail["current"],
+                    "total_items": detail["total"],
+                    "item_description": message,
+                }
+
+                # Build concise message
+                if detail["total"] > 0:
+                    detailed_message = (
+                        f"[{stage_index}/{total_stages}] {stage_names.get(stage, stage)}: "
+                        f"{detail['current']}/{detail['total']} - {message}"
+                    )
+                else:
+                    detailed_message = f"[{stage_index}/{total_stages}] {stage_names.get(stage, stage)}: {message}"
+
+                task_manager.update_task(
+                    task_id,
+                    progress=current_progress,
+                    message=detailed_message,
+                    progress_detail=progress_detail_data,
+                )
+
+            result_state = manager.prepare_simulation(
+                simulation_id=simulation_id,
+                simulation_requirement=simulation_requirement,
+                document_text=document_text,
+                defined_entity_types=entity_types_list,
+                use_llm_for_profiles=use_llm_for_profiles,
+                progress_callback=progress_callback,
+                parallel_profile_count=parallel_profile_count,
+                brief=brief,
+            )
+
+            if contract_mode:
+                # Verify the frozen roster, both profile files and the config against
+                # the Run Contract; any mismatch makes the preparation non-startable
+                with RunStore.lock(simulation_id):
+                    verified = RunContractPreflight.evaluate(simulation_id)
+                    if not verified["ready_to_start"]:
+                        raise ValueError(
+                            "Post-prepare verification against the Run Contract failed: "
+                            + "; ".join(verified["errors"])
+                        )
+
+            # Task complete
+            task_manager.complete_task(
+                task_id, result=result_state.to_simple_dict()
+            )
+
+        except Exception as e:
+            logger.error(f"Simulation preparation failed: {str(e)}")
+            task_manager.fail_task(task_id, str(e))
+
+            # Update simulation state to failed
+            state = manager.get_simulation(simulation_id)
+            if state:
+                state.status = SimulationStatus.FAILED
+                state.error = str(e)
+                manager._save_simulation_state(state)
+
+    # Start background thread
+    thread = threading.Thread(target=run_prepare, daemon=True)
+    thread.start()
+
+    return jsonify(
+        {
+            "success": True,
+            "data": {
+                "simulation_id": simulation_id,
+                "task_id": task_id,
+                "status": "preparing",
+                "message": t("api.prepareStarted"),
+                "already_prepared": False,
+                "expected_entities_count": state.active_agents_count,  # Expected Agent total (active only)
+                "graph_entities_count": state.entities_count,
+                "context_entities_count": state.context_entities_count,
+                "entity_types": state.entity_types,  # Entity type list
+            },
+        }
+    )
 
 
 @simulation_bp.route("/prepare/status", methods=["POST"])
@@ -1986,6 +2155,20 @@ def start_simulation():
                     }
                 ), 404
 
+            # Run Contract: run length and platform are fixed by the contract. A
+            # differing request is refused before anything else happens.
+            contract_mode = _contract_locked(state)
+            if contract_mode:
+                applied = RunContractStore.load(simulation_id) or {}
+                contract_rounds = (applied.get("contract") or {}).get("max_rounds")
+                contract_platform = (applied.get("contract") or {}).get("platform")
+                if max_rounds is not None and max_rounds != contract_rounds:
+                    return jsonify({"success": False, "error": (
+                        f"max_rounds {max_rounds} refused: Locked by Run Contract ({contract_rounds} rounds)")}), 400
+                if "platform" in data and data.get("platform") != contract_platform:
+                    return jsonify({"success": False, "error": (
+                        f"platform {data.get('platform')!r} refused: Locked by Run Contract ({contract_platform!r})")}), 400
+
             current = SimulationRunner.reconcile_run(
                 simulation_id, RunStore.get_current_run(simulation_id)
             )
@@ -2011,20 +2194,35 @@ def start_simulation():
                         simulation_id, current.run_id, started=False, run_exists=True
                     )})
 
-            # A new execution requires a prepared simulation
-            is_prepared, prepare_info = _check_simulation_prepared(simulation_id)
-            if not is_prepared:
-                return jsonify(
-                    {
-                        "success": False,
-                        "error": t("api.simNotReady", status=state.status.value),
-                    }
-                ), 400
+            preflight = None
+            if contract_mode:
+                # The same canonical preflight the UI shows, re-evaluated here under the
+                # simulation lock: nothing can change between this check and the snapshot
+                preflight = RunContractPreflight.evaluate(
+                    simulation_id, {"max_rounds": max_rounds, "platform": data.get("platform")}
+                )
+                if not preflight["ready_to_start"]:
+                    get_logger("mirofish.api.simulation").warning(
+                        f"[{simulation_id}] Start refused by run preflight: {preflight['errors']}"
+                    )
+                    return _preflight_refusal(preflight, "start")
+                max_rounds = preflight["rounds"]["expected"]
+                platform = preflight["platform"]["expected"]
+            else:
+                # A new execution requires a prepared simulation
+                is_prepared, prepare_info = _check_simulation_prepared(simulation_id)
+                if not is_prepared:
+                    return jsonify(
+                        {
+                            "success": False,
+                            "error": t("api.simNotReady", status=state.status.value),
+                        }
+                    ), 400
 
-            # ...and complete required sources (checked again when the run snapshots them)
-            refusal = _coverage_refusal(simulation_id, state.project_id)
-            if refusal:
-                return refusal
+                # ...and complete required sources (checked again when the run snapshots them)
+                refusal = _coverage_refusal(simulation_id, state.project_id)
+                if refusal:
+                    return refusal
 
             previous_run_id = None
             if current is not None and new_run:
@@ -2046,11 +2244,17 @@ def start_simulation():
 
             # Reuse a never-started run (e.g. its process failed to launch) only when
             # it holds no evidence; otherwise create a fresh run directory
-            if current is not None and not new_run and current.status == RunStatus.NOT_STARTED and not current.legacy:
+            reusable = current is not None and not new_run and current.status == RunStatus.NOT_STARTED and not current.legacy
+            if reusable and contract_mode:
+                # A never-started contracted run is reused only when its snapshot was
+                # taken from exactly the configuration that passes now
+                reusable = (current.snapshot.get("contract") or {}).get("preflight_fingerprint") == preflight["fingerprint"]
+            if reusable:
                 run_id = current.run_id
             else:
                 run_id = RunStore.create_run(
-                    simulation_id, platform, max_rounds, previous_run_id=previous_run_id
+                    simulation_id, platform, max_rounds, previous_run_id=previous_run_id,
+                    preflight=preflight,
                 ).run_id
 
             graph_id = state.graph_id

@@ -31,6 +31,7 @@ SNAPSHOT_FILES = (
     "agent_selection.json",
     "experiment_plan.json",
     "source_requirements.json",
+    "run_contract.json",
 )
 
 
@@ -400,6 +401,7 @@ class RunStore:
         platform: str = "parallel",
         max_rounds: Optional[int] = None,
         previous_run_id: Optional[str] = None,
+        preflight: Optional[Dict[str, Any]] = None,
     ) -> RunRecord:
         """
         Create a new run directory with a snapshot of everything the execution uses
@@ -413,6 +415,8 @@ class RunStore:
             platform: twitter / reddit / parallel
             max_rounds: Optional round limit
             previous_run_id: Run this one replaces (restart)
+            preflight: Ready run preflight of a contracted simulation (required when the
+                project carries a Run Contract; see create_contract_run)
 
         Returns:
             The new RunRecord (status not_started)
@@ -421,6 +425,12 @@ class RunStore:
         config_path = os.path.join(sim_dir, "simulation_config.json")
         if not os.path.exists(config_path):
             raise ValueError(f"simulation_config.json not found for {simulation_id}")
+
+        project_id = cls._state_value(simulation_id, "project_id")
+        from .run_contract import project_has_contract
+
+        if preflight is not None or project_has_contract(project_id):
+            return cls._create_contract_run(simulation_id, platform, max_rounds, previous_run_id, preflight)
 
         run_id = cls.new_run_id()
         run_dir = cls.run_dir(simulation_id, run_id)
@@ -510,5 +520,135 @@ class RunStore:
         log.info(
             f"Run created (platform={platform}, max_rounds={max_rounds}, "
             f"previous_run={previous_run_id}, snapshot={copied})"
+        )
+        return record
+
+    @classmethod
+    def _state_value(cls, simulation_id: str, key: str) -> Any:
+        state_file = os.path.join(cls.sim_dir(simulation_id), "state.json")
+        if not os.path.exists(state_file):
+            return None
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                return json.load(f).get(key)
+        except Exception:
+            return None
+
+    @classmethod
+    def _create_contract_run(
+        cls,
+        simulation_id: str,
+        platform: str,
+        max_rounds: Optional[int],
+        previous_run_id: Optional[str],
+        preflight: Optional[Dict[str, Any]],
+    ) -> RunRecord:
+        """
+        Create a contracted run: every snapshot step is mandatory
+
+        The run directory must end up holding run_contract.json, preflight.json and
+        every configuration file byte-identical to what the ready preflight checked;
+        source documents, the brief, the resolved plan and complete source coverage
+        must snapshot without error. Any failure deletes the partial run directory
+        and refuses the run (no warning-and-continue).
+
+        Raises:
+            ValueError: no ready preflight, mismatching request or any snapshot failure
+        """
+        from .run_contract import CONTRACT_FILE
+        from .run_preflight import CONTRACT_RUN_FILES, PREFLIGHT_FILE, file_sha256, summarize_for_run
+
+        if not preflight or preflight.get("mode") != "contract" or preflight.get("ready_to_start") is not True:
+            raise ValueError("A contracted run can only be created from a ready run preflight")
+        expected_rounds = (preflight.get("rounds") or {}).get("expected")
+        if max_rounds != expected_rounds:
+            raise ValueError(f"max_rounds {max_rounds} does not equal the Run Contract ({expected_rounds})")
+        if platform != (preflight.get("platform") or {}).get("expected"):
+            raise ValueError(f"platform {platform!r} does not equal the Run Contract")
+
+        sim_dir = cls.sim_dir(simulation_id)
+        run_id = cls.new_run_id()
+        run_dir = cls.run_dir(simulation_id, run_id)
+        while os.path.exists(run_dir):
+            run_id = cls.new_run_id()
+            run_dir = cls.run_dir(simulation_id, run_id)
+        os.makedirs(run_dir)
+        log = get_run_logger("mirofish.runs", simulation_id, run_id)
+        try:
+            artifacts = preflight.get("artifacts") or {}
+            for name in CONTRACT_RUN_FILES:
+                src = os.path.join(sim_dir, name)
+                if not os.path.exists(src):
+                    raise ValueError(f"{name} is missing")
+                shutil.copy2(src, os.path.join(run_dir, name))
+                copied = file_sha256(os.path.join(run_dir, name))
+                if not artifacts.get(name) or copied != artifacts[name]:
+                    raise ValueError(f"{name} changed after the preflight passed")
+            with open(os.path.join(run_dir, PREFLIGHT_FILE), "w", encoding="utf-8") as f:
+                json.dump(preflight, f, ensure_ascii=False, indent=2)
+
+            project_id = cls._state_value(simulation_id, "project_id")
+            graph_id = cls._state_value(simulation_id, "graph_id")
+            snapshot: Dict[str, Any] = {"files": list(CONTRACT_RUN_FILES) + [PREFLIGHT_FILE]}
+            with open(os.path.join(run_dir, "agent_roster.json"), "r", encoding="utf-8") as f:
+                roster = json.load(f)
+            snapshot["population"] = {
+                "selection_hash": roster.get("selection_hash"),
+                "active_agents": len(roster.get("active_agents", [])),
+                "context_entities": len(roster.get("context_entities", [])),
+            }
+
+            from .run_evidence import snapshot_run_inputs
+            from .research_instructions import _run_source_documents, snapshot_run_plan
+            from .source_requirements import COVERAGE_FILE, check_coverage
+
+            snapshot.update(snapshot_run_inputs(run_dir, project_id))
+            plan_summary = snapshot_run_plan(run_dir, simulation_id)
+            if plan_summary["source"] != "saved" or plan_summary["unresolved_stages"]:
+                raise ValueError(f"experiment plan not resolvable from the contract: {plan_summary}")
+            snapshot["experiment_plan"] = plan_summary
+            with open(os.path.join(run_dir, "source_requirements.json"), "r", encoding="utf-8") as f:
+                coverage = check_coverage(json.load(f), _run_source_documents(run_dir))
+            with open(os.path.join(run_dir, COVERAGE_FILE), "w", encoding="utf-8") as f:
+                json.dump(coverage, f, ensure_ascii=False, indent=2)
+            if not coverage["ok"]:
+                raise ValueError(f"required source sections missing: {coverage['missing']}")
+            snapshot["source_coverage_ok"] = True
+            for required in (CONTRACT_FILE, PREFLIGHT_FILE, COVERAGE_FILE, os.path.join("assessment", "brief.md"),
+                             os.path.join("sources", "manifest.json"), "experiment_plan.json"):
+                if not os.path.exists(os.path.join(run_dir, required)):
+                    raise ValueError(f"snapshot is missing {required}")
+
+            contract_info = summarize_for_run(preflight)
+            contract_info.update({
+                "selection_hash": roster.get("selection_hash"),
+                "experiment_plan_hash": artifacts.get("experiment_plan.json"),
+                "source_requirements_hash": artifacts.get("source_requirements.json"),
+                "run_contract_hash": artifacts.get(CONTRACT_FILE),
+                "stages": plan_summary["stages"],
+            })
+            if contract_info["active_agents"] != snapshot["population"]["active_agents"]:
+                raise ValueError("roster agent count differs from the preflight")
+            snapshot["contract"] = contract_info
+        except Exception as e:
+            log.warning(f"Contracted run refused, snapshot failed: {e}")
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise ValueError(f"Contracted run refused: {e}")
+
+        record = RunRecord(
+            run_id=run_id,
+            simulation_id=simulation_id,
+            status=RunStatus.NOT_STARTED,
+            platform=platform,
+            max_rounds=max_rounds,
+            previous_run_id=previous_run_id,
+            project_id=project_id,
+            graph_id=graph_id,
+            snapshot=snapshot,
+        )
+        cls.save(record)
+        log.info(
+            f"Contracted run created (contract={contract_info['contract_id']}, max_rounds={max_rounds}, "
+            f"agents={contract_info['active_agents']}, previous_run={previous_run_id})"
         )
         return record

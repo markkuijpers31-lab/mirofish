@@ -65,18 +65,19 @@ def _read_text_with_fallback(file_path: str) -> str:
 class FileParser:
     """File parser"""
 
-    SUPPORTED_EXTENSIONS = {".pdf", ".md", ".markdown", ".txt"}
+    # .json is accepted only for Run Contract uploads (see api/graph.allowed_file)
+    SUPPORTED_EXTENSIONS = {".pdf", ".md", ".markdown", ".txt", ".json"}
 
     @classmethod
     def is_supported(cls, file_path: str) -> bool:
         """
-        检查文件是否为支持的格式
-        
+        Check whether the file format is supported
+
         Args:
-            file_path: 文件路径
-            
+            file_path: File path
+
         Returns:
-            如果文件格式受支持则返回 True
+            True if the file format is supported
         """
         suffix = Path(file_path).suffix.lower()
         return suffix in cls.SUPPORTED_EXTENSIONS
@@ -106,7 +107,7 @@ class FileParser:
             return cls._extract_from_pdf(file_path)
         elif suffix in {".md", ".markdown"}:
             return cls._extract_from_md(file_path)
-        elif suffix == ".txt":
+        elif suffix in {".txt", ".json"}:
             return cls._extract_from_txt(file_path)
 
         raise ValueError(t("api.unsupportedFileFormatGeneric", suffix=suffix))

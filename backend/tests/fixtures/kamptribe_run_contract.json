@@ -1,0 +1,423 @@
+{
+  "schema": "mirofish.run_contract.v1",
+  "contract_id": "kamptribe-run-2c-final",
+  "title": "Kamptribe Run 2C (final): organic discovery, neutral exposure and pricing decisions",
+  "platform": "parallel",
+  "max_rounds": 50,
+  "role_catalog": [
+    {
+      "id": "prospect_cold",
+      "label": "Prospect (cold)",
+      "default_evidence_role": "target_consumer"
+    },
+    {
+      "id": "prospect_switcher",
+      "label": "Prospect (switcher)",
+      "default_evidence_role": "target_consumer"
+    },
+    {
+      "id": "existing_free",
+      "label": "Existing Free",
+      "default_evidence_role": "influencer_context"
+    },
+    {
+      "id": "existing_planner",
+      "label": "Existing Planner",
+      "default_evidence_role": "influencer_context"
+    },
+    {
+      "id": "existing_advanced",
+      "label": "Existing Advanced",
+      "default_evidence_role": "influencer_context"
+    },
+    {
+      "id": "existing_trip_pass",
+      "label": "Existing Trip Pass",
+      "default_evidence_role": "influencer_context"
+    },
+    {
+      "id": "lapsed_user",
+      "label": "Lapsed User",
+      "default_evidence_role": "influencer_context"
+    },
+    {
+      "id": "brand_advocate",
+      "label": "Brand Advocate",
+      "default_evidence_role": "influencer_context"
+    },
+    {
+      "id": "context_only",
+      "label": "Context Only",
+      "default_evidence_role": "excluded"
+    }
+  ],
+  "population": [
+    {
+      "persona_id": "C01",
+      "simulation_role": "prospect_cold",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C02",
+      "simulation_role": "prospect_cold",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C03",
+      "simulation_role": "prospect_cold",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C04",
+      "simulation_role": "prospect_cold",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C05",
+      "simulation_role": "prospect_cold",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C06",
+      "simulation_role": "prospect_cold",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C07",
+      "simulation_role": "prospect_cold",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C08",
+      "simulation_role": "prospect_cold",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C09",
+      "simulation_role": "prospect_switcher",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C10",
+      "simulation_role": "prospect_switcher",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C11",
+      "simulation_role": "prospect_switcher",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C12",
+      "simulation_role": "prospect_switcher",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C13",
+      "simulation_role": "prospect_switcher",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C14",
+      "simulation_role": "prospect_switcher",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C15",
+      "simulation_role": "prospect_switcher",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "C16",
+      "simulation_role": "prospect_switcher",
+      "evidence_role": "target_consumer"
+    },
+    {
+      "persona_id": "U01",
+      "simulation_role": "existing_free",
+      "evidence_role": "influencer_context"
+    },
+    {
+      "persona_id": "U02",
+      "simulation_role": "existing_planner",
+      "evidence_role": "influencer_context"
+    },
+    {
+      "persona_id": "U03",
+      "simulation_role": "existing_advanced",
+      "evidence_role": "influencer_context"
+    },
+    {
+      "persona_id": "U04",
+      "simulation_role": "existing_trip_pass",
+      "evidence_role": "influencer_context"
+    },
+    {
+      "persona_id": "U05",
+      "simulation_role": "lapsed_user",
+      "evidence_role": "influencer_context"
+    },
+    {
+      "persona_id": "A01",
+      "simulation_role": "brand_advocate",
+      "evidence_role": "influencer_context"
+    },
+    {
+      "persona_id": "A02",
+      "simulation_role": "brand_advocate",
+      "evidence_role": "influencer_context"
+    },
+    {
+      "persona_id": "A03",
+      "simulation_role": "brand_advocate",
+      "evidence_role": "influencer_context"
+    }
+  ],
+  "reject_unlisted_active_entities": true,
+  "preflight_expectations": {
+    "active_agents": 24,
+    "target_consumers": 16,
+    "influencer_context": 8,
+    "excluded_active": 0,
+    "stages": 7,
+    "max_rounds": 50
+  },
+  "source_requirements": {
+    "documents": [
+      {
+        "id": "product_truth",
+        "label": "Product Truth",
+        "filename_pattern": "product[-_ ]?truth",
+        "authoritative": true,
+        "sections": [
+          {
+            "id": "product-overview",
+            "label": "Product overview",
+            "required_terms": [
+              "camping road-trip planner"
+            ],
+            "min_chars": 120
+          },
+          {
+            "id": "tiers",
+            "label": "Tiers",
+            "required_terms": [
+              "Free",
+              "Planner",
+              "Advanced",
+              "Trip Pass"
+            ],
+            "min_chars": 120
+          },
+          {
+            "id": "pricing",
+            "label": "Pricing",
+            "required_terms": [
+              "3.99",
+              "6.99",
+              "19.99",
+              "Trip Pass"
+            ],
+            "min_chars": 120
+          },
+          {
+            "id": "trip-pass",
+            "label": "Trip Pass",
+            "required_terms": [
+              "never renews"
+            ]
+          },
+          {
+            "id": "not-built",
+            "label": "Does not exist",
+            "required_terms": [
+              "no campground bookings",
+              "no live campsite availability"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "experiment_plan": {
+    "seed_blocked_terms": [
+      "Kamptribe"
+    ],
+    "derived_fields": {
+      "ORGANIC_DISCOVERY": {
+        "type": "first_encounter_before_record",
+        "terms": [
+          "Kamptribe"
+        ],
+        "record": "EXPOSED",
+        "evidence_roles": [
+          "target_consumer"
+        ]
+      }
+    },
+    "stages": [
+      {
+        "id": "s1_cold_trip_planning",
+        "name": "Cold prospects plan a trip",
+        "order": 1,
+        "trigger_round": 1,
+        "target": {
+          "simulation_roles": [
+            "prospect_cold"
+          ]
+        },
+        "private_instruction": "Your next camping road trip is coming up soon. Think through how you would normally plan the route, the campgrounds and the stops, and talk about it the way you usually would online.",
+        "condition": {
+          "type": "always"
+        },
+        "completion": {
+          "type": "any_action"
+        }
+      },
+      {
+        "id": "s2_switcher_friction",
+        "name": "Switchers hit friction with their current tool",
+        "order": 2,
+        "trigger_round": 1,
+        "target": {
+          "simulation_roles": [
+            "prospect_switcher"
+          ]
+        },
+        "private_instruction": "Lately your usual trip planning tool has been frustrating you when you try to fit campgrounds and drive times into one plan. Decide for yourself whether that is worth mentioning or looking into.",
+        "condition": {
+          "type": "always"
+        },
+        "completion": {
+          "type": "any_action"
+        }
+      },
+      {
+        "id": "s3_existing_users_experience",
+        "name": "Existing and lapsed users share real experience",
+        "order": 3,
+        "trigger_round": 2,
+        "target": {
+          "persona_ids": [
+            "U01",
+            "U02",
+            "U03",
+            "U04",
+            "U05"
+          ]
+        },
+        "private_instruction": "Remember honestly how you have used your trip planner so far, including what you liked and what annoyed you. Only bring it up when it fits a conversation.",
+        "context_sections": [
+          "tiers",
+          "pricing"
+        ],
+        "condition": {
+          "type": "always"
+        },
+        "completion": {
+          "type": "on_delivery"
+        }
+      },
+      {
+        "id": "s4_advocates_context",
+        "name": "Advocates may recommend when relevant",
+        "order": 4,
+        "trigger_round": 3,
+        "target": {
+          "persona_ids": [
+            "A01",
+            "A02",
+            "A03"
+          ]
+        },
+        "private_instruction": "You genuinely like the planner you use. You may recommend it when someone clearly asks for help planning a camping trip, but you never push it unprompted.",
+        "context_sections": [
+          "product-overview"
+        ],
+        "condition": {
+          "type": "always"
+        },
+        "completion": {
+          "type": "on_delivery"
+        }
+      },
+      {
+        "id": "s5_neutral_exposure",
+        "name": "Neutral exposure for prospects who did not find it",
+        "order": 5,
+        "trigger_round": 15,
+        "target": {
+          "evidence_roles": [
+            "target_consumer"
+          ]
+        },
+        "private_instruction": "While looking for campgrounds you come across a trip planner you had not looked at before. Decide freely whether you ignore it, look into it, try it or reject it.",
+        "context_sections": [
+          "product-overview",
+          "not-built"
+        ],
+        "records": [
+          "EXPOSED"
+        ],
+        "condition": {
+          "type": "authored_not_mentioned",
+          "terms": [
+            "Kamptribe"
+          ]
+        },
+        "completion": {
+          "type": "rounds_elapsed",
+          "rounds": 5
+        }
+      },
+      {
+        "id": "s6_pricing_decision",
+        "name": "Pricing becomes visible after exposure",
+        "order": 6,
+        "trigger_round": 30,
+        "target": {
+          "evidence_roles": [
+            "target_consumer"
+          ]
+        },
+        "private_instruction": "You now see what the paid options of that planner would cost you for your next trip. Weigh it against what you use today and decide what, if anything, you would pay for.",
+        "context_sections": [
+          "pricing",
+          "trip-pass"
+        ],
+        "records": [
+          "PRICING_SEEN"
+        ],
+        "condition": {
+          "type": "stage_completed",
+          "stage_id": "s5_neutral_exposure"
+        },
+        "completion": {
+          "type": "action_types",
+          "action_types": [
+            "CREATE_POST",
+            "CREATE_COMMENT"
+          ]
+        }
+      },
+      {
+        "id": "s7_final_choice",
+        "name": "Final planning choice",
+        "order": 7,
+        "trigger_round": 45,
+        "target": {
+          "evidence_roles": [
+            "target_consumer"
+          ]
+        },
+        "private_instruction": "Your trip is close. Settle on how you will actually plan it and whether any paid planner is part of that, and act on it the way you normally would.",
+        "condition": {
+          "type": "always"
+        },
+        "completion": {
+          "type": "any_action"
+        }
+      }
+    ]
+  }
+}

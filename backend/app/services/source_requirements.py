@@ -233,8 +233,10 @@ def simulation_coverage(simulation_id: str, project_id: Optional[str]) -> Option
     spec = SourceRequirementsStore.load(simulation_id)
     if spec is None:
         return None
+    from .run_contract import without_contract_documents
+
     documents = ProjectManager.get_source_documents(project_id) if project_id else []
-    return check_coverage(spec, documents)
+    return check_coverage(spec, without_contract_documents(documents))
 
 
 def coverage_error(coverage: Optional[Dict[str, Any]]) -> Optional[str]:

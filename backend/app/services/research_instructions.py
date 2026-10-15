@@ -18,7 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.persona_ids import parse_identifier
-from .assessment_spec import BRIEF_FILENAME_RE
+from .assessment_spec import BRIEF_FILENAME_RE, is_run_contract_filename
 
 logger = get_logger("mirofish.research_instructions")
 
@@ -140,10 +140,17 @@ def strip_private_text(text: str, private_texts: Iterable[str]) -> str:
 
 
 def split_brief_documents(documents: Iterable[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """(brief documents, context documents) by the brief filename convention"""
+    """
+    (brief documents, context documents) by the brief filename convention
+
+    Run Contract documents are control-plane input: they are in neither list.
+    """
     brief, context = [], []
     for doc in documents or []:
-        (brief if BRIEF_FILENAME_RE.search(doc.get("original_filename") or "") else context).append(doc)
+        name = doc.get("original_filename") or ""
+        if is_run_contract_filename(name):
+            continue
+        (brief if BRIEF_FILENAME_RE.search(name) else context).append(doc)
     return brief, context
 
 
@@ -505,6 +512,8 @@ def _run_source_documents(run_dir: str) -> List[Dict[str, Any]]:
         manifest = json.load(f)
     documents = []
     for doc in manifest.get("documents", []):
+        if is_run_contract_filename(doc.get("original_filename")):
+            continue  # control document, never a source
         text_path = os.path.join(run_dir, "sources", doc.get("text_file") or "")
         text = ""
         if doc.get("text_file") and os.path.exists(text_path):
@@ -552,11 +561,20 @@ def snapshot_run_plan(run_dir: str, simulation_id: str) -> Dict[str, Any]:
     if os.path.exists(brief_path):
         with open(brief_path, "r", encoding="utf-8") as f:
             brief_text = f.read()
-    brief_instructions = [i["text"] for i in extract_private_instructions(brief_text)]
     saved = _read(PLAN_FILE)
-    if saved is not None and saved.get("saved"):
+    contract = _read("run_contract.json")
+    if contract is not None:
+        # Contracted run: the Run Contract owns the stages. Brief prose never becomes
+        # a stage or a private text, and a plan of another contract is refused.
+        if not saved or not saved.get("saved") or saved.get("contract_hash") != contract.get("contract_hash"):
+            raise ValueError("experiment_plan.json of this run does not belong to its Run Contract")
+        brief_instructions = []
+        plan, source = validate_plan(saved), "saved"
+    elif saved is not None and saved.get("saved"):
+        brief_instructions = [i["text"] for i in extract_private_instructions(brief_text)]
         plan, source = validate_plan(saved), "saved"
     else:
+        brief_instructions = [i["text"] for i in extract_private_instructions(brief_text)]
         plan, source = validate_plan(plan_from_brief(brief_text, extract_spec_regex(brief_text).persona_ids)), "brief"
     wanted = [sid for s in plan["stages"] for sid in s.get("context_sections") or []]
     if wanted:
@@ -575,6 +593,9 @@ def snapshot_run_plan(run_dir: str, simulation_id: str) -> Dict[str, Any]:
             "Check the persona ids / roles of these stages against the agent selection."
         )
     resolved["source"] = source
+    if contract is not None:
+        resolved["contract_id"] = contract.get("contract_id")
+        resolved["contract_hash"] = contract.get("contract_hash")
     resolved["simulation_id"] = simulation_id
     resolved["resolved_at"] = datetime.now().isoformat()
     with open(os.path.join(run_dir, PLAN_FILE), "w", encoding="utf-8") as f:

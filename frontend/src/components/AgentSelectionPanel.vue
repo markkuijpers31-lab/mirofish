@@ -33,7 +33,8 @@
       </p>
     </div>
 
-    <p v-if="locked && !editing" class="locked-note">
+    <p v-if="contractLocked" class="locked-note contract-lock">🔒 {{ $t('runContract.populationLocked') }}</p>
+    <p v-else-if="locked && !editing" class="locked-note">
       {{ legacyPrepared ? $t('agentSelection.legacyPrepared', { count: data?.population?.legacy_agents_count || 0 }) : $t('agentSelection.lockedNote') }}
     </p>
 
@@ -184,7 +185,8 @@
     <details class="sub-panel" :open="stages.length > 0">
       <summary>
         {{ $t('agentSelection.stagesTitle', { count: stages.length }) }}
-        <span v-if="!planSaved && stages.length" class="tag brief">{{ $t('agentSelection.fromBrief') }}</span>
+        <span v-if="contractLocked" class="tag contract">{{ $t('runContract.lockedTag') }}</span>
+        <span v-else-if="!planSaved && stages.length" class="tag brief">{{ $t('agentSelection.fromBrief') }}</span>
       </summary>
       <p class="section-desc">{{ $t('agentSelection.stagesDesc') }}</p>
       <div v-for="(s, idx) in stages" :key="idx" class="stage-card">
@@ -234,11 +236,11 @@
       </div>
     </details>
 
-    <!-- Confirm -->
-    <div class="confirm-row">
+    <!-- Confirm (saving never prepares: Prepare is a separate explicit action) -->
+    <div class="confirm-row" v-if="!contractLocked">
       <template v-if="editable">
         <button class="action-btn primary" :disabled="summary.active === 0 || saving || busy" @click="confirm">
-          {{ $t('agentSelection.confirmAndPrepare', { active: summary.active, total: summary.total }) }}
+          {{ $t('agentSelection.confirmPopulation', { active: summary.active, total: summary.total }) }}
         </button>
         <button v-if="locked" class="action-btn secondary" :disabled="saving" @click="cancelEdit">{{ $t('agentSelection.cancelEdit') }}</button>
         <span class="confirm-note">{{ $t('agentSelection.confirmNote') }}</span>
@@ -263,6 +265,7 @@ import {
   selectionPayload,
   summarizeSelection,
 } from '../utils/agentSelection'
+import { afterSelectionSaved, selectionEditable } from '../utils/runContract'
 
 const { t } = useI18n()
 
@@ -271,9 +274,11 @@ const props = defineProps({
   selection: Object, // GET /agent-selection response
   locked: Boolean, // population already prepared: read-only until "change"
   busy: Boolean, // preparation running
+  contractLocked: Boolean, // a Run Contract owns population, roles and stages: read-only
 })
 
-const emit = defineEmits(['confirmed', 'add-log'])
+// 'confirmed' and 'save-failed' both make the parent re-read the persisted state
+const emit = defineEmits(['confirmed', 'save-failed', 'add-log'])
 
 const data = ref(null)
 const rows = ref([])
@@ -295,9 +300,13 @@ const completionTypes = ref(['on_delivery'])
 const savingPlan = ref(false)
 const planMessage = ref('')
 const planError = ref(false)
+// Plan fields this editor does not show; passed through unchanged on save
+const planExtras = ref({})
 
-const editable = computed(() => (!props.locked || editing.value) && !props.busy)
-const planEditable = computed(() => !props.busy)
+const editable = computed(() => selectionEditable({
+  contractLocked: props.contractLocked, locked: props.locked, editing: editing.value, busy: props.busy,
+}))
+const planEditable = computed(() => !props.busy && !props.contractLocked)
 const legacyPrepared = computed(() => Boolean(data.value?.population?.legacy_prepared))
 
 const loadFrom = (selection) => {
@@ -358,12 +367,13 @@ const confirm = async () => {
   error.value = ''
   try {
     const res = await saveAgentSelection(props.simulationId, selectionPayload(rows.value, roleCatalog.value, true))
-    loadFrom(res.data)
     editing.value = false
     emit('add-log', t('agentSelection.logConfirmed', { active: res.data.summary.active_agents, total: res.data.summary.graph_entities }))
-    emit('confirmed', res.data)
+    emit('confirmed', { selection: res.data, next: afterSelectionSaved() })
   } catch (err) {
     error.value = errorText(err)
+    // The UI must show what is persisted, never an unsaved local selection as confirmed
+    emit('save-failed', error.value)
   } finally {
     saving.value = false
   }
@@ -391,9 +401,17 @@ const loadPlan = async () => {
     const res = await getExperimentPlan(props.simulationId)
     stages.value = (res.data.stages || []).map(toEditable)
     planSaved.value = Boolean(res.data.saved)
+    planExtras.value = {
+      seed_blocked_terms: res.data.seed_blocked_terms || [],
+      derived_fields: res.data.derived_fields || {},
+    }
     conditionTypes.value = res.data.condition_types || conditionTypes.value
     completionTypes.value = res.data.completion_types || completionTypes.value
+    planError.value = false
   } catch (err) {
+    // An unreadable plan is shown as unknown, never as the last saved one
+    stages.value = []
+    planSaved.value = false
     planMessage.value = errorText(err)
     planError.value = true
   }
@@ -410,6 +428,7 @@ const savePlan = async () => {
   planError.value = false
   try {
     const payload = {
+      ...planExtras.value,
       stages: stages.value.map((s, i) => ({
         id: s.id,
         name: s.name,
@@ -436,22 +455,27 @@ const savePlan = async () => {
       })),
     }
     const res = await saveExperimentPlan(props.simulationId, payload)
-    stages.value = (res.data.stages || []).map(toEditable)
-    planSaved.value = true
-    planMessage.value = t('agentSelection.stagesSaved')
-    emit('add-log', t('agentSelection.logStagesSaved', { count: stages.value.length }))
+    emit('add-log', t('agentSelection.logStagesSaved', { count: (res.data.stages || []).length }))
+    // Show the persisted plan, not the local edit
+    await loadPlan()
+    if (!planError.value) planMessage.value = t('agentSelection.stagesSaved')
   } catch (err) {
     planMessage.value = errorText(err)
     planError.value = true
+    planSaved.value = false
   } finally {
     savingPlan.value = false
   }
 }
 
 watch(() => props.simulationId, () => loadPlan(), { immediate: true })
+// Applying a Run Contract replaces the plan: re-read it whenever the selection reloads
+watch(() => props.selection, () => loadPlan())
 </script>
 
 <style scoped>
+.contract-lock { color: #000; font-weight: 700; }
+.tag.contract { background: #000; color: #FFF; }
 .agent-selection {
   display: flex;
   flex-direction: column;

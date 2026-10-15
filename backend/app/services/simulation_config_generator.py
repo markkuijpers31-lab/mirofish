@@ -280,6 +280,7 @@ class SimulationConfigGenerator:
         roster: Optional[Dict[str, Any]] = None,
         private_texts: Optional[List[str]] = None,
         brief_text: str = "",
+        seed_blocked_terms: Optional[List[str]] = None,
     ) -> SimulationParameters:
         """
         Intelligently generate the complete simulation configuration (step-by-step generation)
@@ -298,6 +299,7 @@ class SimulationConfigGenerator:
             roster: Frozen agent roster (roles per active agent)
             private_texts: Private research instructions (never allowed in seed posts)
             brief_text: Assessment brief (verbatim copies are rejected as seed posts)
+            seed_blocked_terms: Terms seed posts may not contain (e.g. the product under test)
 
         Returns:
             SimulationParameters: Complete simulation parameters
@@ -392,7 +394,7 @@ class SimulationConfigGenerator:
 
         # Seed posts are in-world content only: drop anything that carries research
         # instructions, persona tasks or verbatim brief text
-        event_config = self._filter_seed_posts(event_config, private_texts, brief_text)
+        event_config = self._filter_seed_posts(event_config, private_texts, brief_text, seed_blocked_terms)
 
         reasoning_parts.append(
             t("progress.agentConfigResult", count=len(all_agent_configs))
@@ -847,7 +849,8 @@ Return JSON format (no markdown):
         )
 
     def _filter_seed_posts(
-        self, event_config: EventConfig, private_texts: List[str], brief_text: str
+        self, event_config: EventConfig, private_texts: List[str], brief_text: str,
+        blocked_terms: Optional[List[str]] = None,
     ) -> EventConfig:
         """
         Remove seed posts that carry research/orchestration content
@@ -863,6 +866,9 @@ Return JSON format (no markdown):
             if not content:
                 continue
             unsafe, reason = is_unsafe_public_text(content, private_texts, brief_text)
+            hit = next((t for t in blocked_terms or [] if t and t.lower() in content.lower()), None)
+            if hit and not unsafe:
+                unsafe, reason = True, f"mentions blocked term '{hit}'"
             if unsafe:
                 logger.warning(f"Seed post rejected ({reason}): {content[:80]!r}")
                 event_config.rejected_seed_posts.append({"content": content, "reason": reason,
