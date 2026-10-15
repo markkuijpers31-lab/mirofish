@@ -19,6 +19,7 @@ from .entity_reader import EntityReader, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
 from .research_instructions import ExperimentPlanStore, plan_from_brief, resolve_plan, validate_plan
+from .run_contract import RunContractStore, project_has_contract
 from ..utils.locale import t
 
 logger = get_logger("mirofish.simulation")
@@ -368,15 +369,28 @@ class SimulationManager:
             # resolved per run (RunStore.create_run), so stages are run-scoped.
             brief = brief or {}
             saved_plan = ExperimentPlanStore.load(simulation_id)
+            contract = RunContractStore.load(simulation_id)
+            if contract is None and project_has_contract(state.project_id):
+                raise ValueError("The project has a Run Contract that is not applied to this simulation")
+            if contract is not None:
+                # The Run Contract owns the stages: never fall back to brief prose,
+                # and brief "instructions" (cohort prose) are not private texts
+                if saved_plan is None or saved_plan.get("contract_hash") != contract.get("contract_hash"):
+                    raise ValueError("experiment_plan.json does not belong to the applied Run Contract")
+                roster["contract_id"] = contract.get("contract_id")
+                roster["contract_hash"] = contract.get("contract_hash")
+                extra_private_texts = []
+            else:
+                extra_private_texts = [i.get("text") for i in brief.get("instructions", [])]
             plan = validate_plan(
                 saved_plan if saved_plan is not None
                 else plan_from_brief(brief.get("brief_text", ""), brief.get("persona_ids")),
                 [r["id"] for r in roster["role_catalog"]],
             )
-            resolved_plan = resolve_plan(
-                plan, roster, [i.get("text") for i in brief.get("instructions", [])]
-            )
+            resolved_plan = resolve_plan(plan, roster, extra_private_texts)
             private_texts = resolved_plan["private_texts"]
+            if contract is not None and resolved_plan["unresolved_stages"]:
+                raise ValueError(f"Run Contract stages target no active agent: {resolved_plan['unresolved_stages']}")
 
             AgentSelectionStore.save_roster(simulation_id, roster)
             state.active_agents_count = len(active_entities)
@@ -513,6 +527,7 @@ class SimulationManager:
                 roster=roster,
                 private_texts=private_texts,
                 brief_text=brief.get("brief_text", ""),
+                seed_blocked_terms=plan.get("seed_blocked_terms") or [],
             )
 
             if progress_callback:

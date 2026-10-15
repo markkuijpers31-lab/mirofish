@@ -13,7 +13,8 @@ export const createSimulation = (data) => {
  * @param {Object} data - { simulation_id, entity_types?, use_llm_for_profiles?, parallel_profile_count?, force_regenerate? }
  */
 export const prepareSimulation = (data) => {
-  return requestWithRetry(() => service.post('/api/simulation/prepare', data), 3, 1000)
+  // Not retried: preparation spends LLM budget and must stay one explicit action
+  return service.post('/api/simulation/prepare', data)
 }
 
 /**
@@ -53,6 +54,26 @@ export const getExperimentPlan = (simulationId) => {
  */
 export const saveExperimentPlan = (simulationId, data) => {
   return service.put(`/api/simulation/${simulationId}/experiment-plan`, data)
+}
+
+/**
+ * Run preflight: the persisted configuration checked against the project's Run Contract
+ * (never cached; reading changes nothing)
+ * @param {string} simulationId
+ * @returns {Promise<Object>} { mode, contract, population, roles, experiment_plan, rounds, sources,
+ *   preparation, ready_to_prepare, ready_to_start, errors, fingerprint }
+ */
+export const getPreflight = (simulationId) => {
+  return service.get(`/api/simulation/${simulationId}/preflight`, { params: { _: Date.now() } })
+}
+
+/**
+ * Apply the project's Run Contract (deterministic; never prepares, never calls an LLM)
+ * @param {string} simulationId
+ * @returns {Promise<Object>} { applied, confirmed, preparation_invalidated, errors, preflight }
+ */
+export const applyRunContract = (simulationId) => {
+  return service.post(`/api/simulation/${simulationId}/run-contract/apply`)
 }
 
 /**

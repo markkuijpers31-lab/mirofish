@@ -146,7 +146,7 @@
                 ref="fileInput"
                 type="file"
                 multiple
-                accept=".pdf,.md,.txt"
+                accept=".pdf,.md,.txt,.json"
                 class="upload-input"
                 @change="handleFileSelect"
                 :disabled="loading"
@@ -299,7 +299,8 @@ const handleDrop = (e) => {
 const addFiles = (newFiles) => {
   const validFiles = newFiles.filter((file) => {
     const ext = file.name.split('.').pop().toLowerCase()
-    return ['pdf', 'md', 'txt'].includes(ext)
+    // A Run Contract may also be plain JSON (see backend services/run_contract.py)
+    return ['pdf', 'md', 'txt'].includes(ext) || (ext === 'json' && /run[-_ ]?contract/i.test(file.name))
   })
   files.value.push(...validFiles)
 }

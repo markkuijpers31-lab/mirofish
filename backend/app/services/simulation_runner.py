@@ -415,8 +415,21 @@ class SimulationRunner:
         minutes_per_round = time_config.get("minutes_per_round", 30)
         total_rounds = int(total_hours * 60 / minutes_per_round)
 
+        # A contracted run executes exactly the Run Contract's rounds, never a
+        # length derived from the generated time_config
+        from .run_contract import contract_round_count
+
+        contract_rounds = contract_round_count(run_dir)
+        if contract_rounds is not None:
+            if max_rounds is not None and max_rounds != contract_rounds:
+                raise ValueError(
+                    f"max_rounds {max_rounds} differs from the Run Contract of run {run_id} ({contract_rounds})"
+                )
+            max_rounds = contract_rounds
+            total_rounds = contract_rounds
+            log.info(f"Run length locked by Run Contract: exactly {contract_rounds} rounds")
         # If max_rounds specified, truncate
-        if max_rounds is not None and max_rounds > 0:
+        elif max_rounds is not None and max_rounds > 0:
             original_rounds = total_rounds
             total_rounds = min(total_rounds, max_rounds)
             if total_rounds < original_rounds:

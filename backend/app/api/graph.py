@@ -18,6 +18,7 @@ from ..utils.logger import get_logger
 from ..utils.locale import t, get_locale, set_locale
 from ..models.task import TaskManager, TaskStatus
 from ..models.project import ProjectManager, ProjectStatus
+from ..services.assessment_spec import is_run_contract_filename
 
 # Get logger
 logger = get_logger("mirofish.api")
@@ -28,6 +29,9 @@ def allowed_file(filename: str) -> bool:
     if not filename or "." not in filename:
         return False
     ext = os.path.splitext(filename)[1].lower().lstrip(".")
+    # A Run Contract may also be uploaded as plain JSON
+    if ext == "json" and is_run_contract_filename(filename):
+        return True
     return ext in Config.ALLOWED_EXTENSIONS
 
 
@@ -231,7 +235,9 @@ def generate_ontology():
                 f"status={entry['extraction_status']} chars={len(text)}"
             )
 
-            if text.strip():
+            # A Run Contract is control-plane input, never world knowledge: its
+            # text is stored per file but never reaches the ontology or the graph
+            if text.strip() and not is_run_contract_filename(file_info["original_filename"]):
                 document_texts.append(text)
                 all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
 
@@ -397,13 +403,16 @@ def build_graph():
         text = ProjectManager.get_extracted_text(project_id)
         from ..services.research_instructions import split_brief_documents
 
-        brief_docs, context_docs = split_brief_documents(ProjectManager.get_source_documents(project_id))
-        if brief_docs and any(d.get("origin") == "per_file_text" for d in brief_docs):
+        all_docs = ProjectManager.get_source_documents(project_id)
+        brief_docs, context_docs = split_brief_documents(all_docs)
+        control_docs = [d for d in all_docs if is_run_contract_filename(d.get("original_filename"))]
+        excluded = brief_docs + control_docs
+        if excluded and any(d.get("origin") == "per_file_text" for d in excluded):
             text = "".join(
                 f"\n\n=== {d.get('original_filename')} ===\n{d.get('text') or ''}" for d in context_docs
             )
             logger.info(
-                f"Graph build excludes brief documents: {[d.get('original_filename') for d in brief_docs]}"
+                f"Graph build excludes brief/control documents: {[d.get('original_filename') for d in excluded]}"
             )
         if not text:
             return jsonify({"success": False, "error": t("api.textNotFound")}), 400

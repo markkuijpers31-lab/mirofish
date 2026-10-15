@@ -171,7 +171,7 @@ def init_logging_for_simulation(simulation_dir: str):
 
 
 from action_logger import SimulationLogManager, PlatformActionLogger
-from run_orchestration import ORIGIN_SYSTEM_SEED, RunOrchestrator, max_trace_rowid
+from run_orchestration import ORIGIN_SYSTEM_SEED, RunOrchestrator, max_trace_rowid, resolve_total_rounds
 
 try:
     from camel.models import ModelFactory
@@ -1243,6 +1243,8 @@ async def run_twitter_simulation(
 
     # Private experiment stages, origins and seed content (see run_orchestration.py)
     orchestrator = RunOrchestrator(config, simulation_dir, action_logger)
+    # Private instructions are stripped/withheld before OASIS persists public text
+    orchestrator.guard_platform(result.env.platform)
 
     # Execute initial events: in-world seed posts only (origin system_seed).
     # Research instructions never become posts; they are delivered privately.
@@ -1304,16 +1306,10 @@ async def run_twitter_simulation(
     time_config = config.get("time_config", {})
     total_hours = time_config.get("total_simulation_hours", 72)
     minutes_per_round = time_config.get("minutes_per_round", 30)
-    total_rounds = (total_hours * 60) // minutes_per_round
-
-    # Truncate if a max round count is specified
-    if max_rounds is not None and max_rounds > 0:
-        original_rounds = total_rounds
-        total_rounds = min(total_rounds, max_rounds)
-        if total_rounds < original_rounds:
-            log_info(
-                f"Rounds truncated: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})"
-            )
+    # Exactly the Run Contract's rounds for a contracted run; otherwise the
+    # generated time_config, truncated by max_rounds
+    total_rounds, rounds_source = resolve_total_rounds(config, simulation_dir, max_rounds)
+    log_info(f"Rounds: {total_rounds} ({rounds_source})")
 
     start_time = datetime.now()
 
@@ -1473,6 +1469,8 @@ async def run_reddit_simulation(
 
     # Private experiment stages, origins and seed content (see run_orchestration.py)
     orchestrator = RunOrchestrator(config, simulation_dir, action_logger)
+    # Private instructions are stripped/withheld before OASIS persists public text
+    orchestrator.guard_platform(result.env.platform)
 
     # Execute initial events: in-world seed posts only (origin system_seed).
     # Research instructions never become posts; they are delivered privately.
@@ -1534,16 +1532,10 @@ async def run_reddit_simulation(
     time_config = config.get("time_config", {})
     total_hours = time_config.get("total_simulation_hours", 72)
     minutes_per_round = time_config.get("minutes_per_round", 30)
-    total_rounds = (total_hours * 60) // minutes_per_round
-
-    # Truncate if a max round count is specified
-    if max_rounds is not None and max_rounds > 0:
-        original_rounds = total_rounds
-        total_rounds = min(total_rounds, max_rounds)
-        if total_rounds < original_rounds:
-            log_info(
-                f"Rounds truncated: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})"
-            )
+    # Exactly the Run Contract's rounds for a contracted run; otherwise the
+    # generated time_config, truncated by max_rounds
+    total_rounds, rounds_source = resolve_total_rounds(config, simulation_dir, max_rounds)
+    log_info(f"Rounds: {total_rounds} ({rounds_source})")
 
     start_time = datetime.now()
 
@@ -1701,12 +1693,9 @@ async def main():
     log_manager.info(f"  - Total simulation duration: {total_hours} hours")
     log_manager.info(f"  - Time per round: {minutes_per_round} minutes")
     log_manager.info(f"  - Configured total rounds: {config_total_rounds}")
-    if args.max_rounds:
-        log_manager.info(f"  - Max round limit: {args.max_rounds}")
-        if args.max_rounds < config_total_rounds:
-            log_manager.info(
-                f"  - Actual executed rounds: {args.max_rounds} (truncated)"
-            )
+    # Fails before any environment starts when --max-rounds conflicts with a Run Contract
+    executed_rounds, rounds_source = resolve_total_rounds(config, simulation_dir, args.max_rounds)
+    log_manager.info(f"  - Executed rounds: {executed_rounds} ({rounds_source})")
     log_manager.info(f"  - Agent count: {len(config.get('agent_configs', []))}")
 
     log_manager.info("Log structure:")

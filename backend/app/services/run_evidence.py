@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils.logger import get_run_logger
 from ..utils.persona_ids import PersonaIndex, build_persona_index, parse_identifier
-from .assessment_spec import BRIEF_FILENAME_RE, compose_brief, extract_spec_regex
+from .assessment_spec import BRIEF_FILENAME_RE, compose_brief, extract_spec_regex, is_run_contract_filename
 from .agent_selection import EVIDENCE_TARGET_CONSUMER, ROSTER_FILE
 from .research_instructions import (
     ORIGIN_AGENT_GENERATED, ORIGIN_ORCHESTRATION, ORIGIN_RESEARCHER_INSTRUCTION, ORIGIN_SYSTEM_SEED, ORIGINS,
@@ -241,6 +241,9 @@ class RunEvidence:
         self.events: Dict[str, List[Dict[str, Any]]] = {p: [] for p in PLATFORMS}
         self.integrity: Dict[str, Any] = {"warnings": [], "platforms": {}}
         self.sources: List[Dict[str, Any]] = []
+        # Run Contract documents: snapshotted control input, never report evidence
+        self.control_documents: List[str] = []
+        self.run_contract: Optional[Dict[str, Any]] = None
         self.sources_origin = "run_snapshot"
         self.brief_text = ""
         self.brief_documents: List[str] = []
@@ -325,6 +328,11 @@ class RunEvidence:
                         "text": doc.get("text") or "",
                     })
 
+        self.control_documents = [
+            d.get("original_filename") for d in self.sources if is_run_contract_filename(d.get("original_filename"))
+        ]
+        self.sources = [d for d in self.sources if not is_run_contract_filename(d.get("original_filename"))]
+        self.run_contract = _read_json(os.path.join(self.run_dir, "run_contract.json"), None)
         self.brief_documents = [
             d.get("original_filename")
             for d in self.sources
@@ -858,6 +866,11 @@ class RunEvidence:
             "stage_timelines": {cid: self.persona_stage_timeline(cid) for cid in self.persona_index.personas},
             "sources_origin": self.sources_origin,
             "sources": self.source_manifest(),
+            "control_documents": self.control_documents,
+            "run_contract": {
+                "contract_id": self.run_contract.get("contract_id"),
+                "contract_hash": self.run_contract.get("contract_hash"),
+            } if self.run_contract else None,
             "stats": self.stats(),
             "evidence_type": "simulated (synthetic agents in an OASIS social-media simulation; not real-world customer data)",
         }

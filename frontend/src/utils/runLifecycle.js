@@ -55,18 +55,17 @@ export function canGenerateReport(runStatus) {
  *
  * - 'attach'         a run is active: poll it, never start another one
  * - 'show_finished'  a run already finished: show it, never restart it
- * - 'start'          no run exists AND the user just clicked "Start" in Step 2
- * - 'show_idle'      no run exists and nothing was requested (reload, navigation):
- *                    show a Start button and wait for the user
+ * - 'show_idle'      no run exists: show the preflight and an explicit Start button
+ *
+ * Mounting (navigation from Step 2, reload, browser back/forward) never starts a
+ * run: only the Start click in Step 3, after a fresh backend preflight, does.
  *
  * @param {Object} input
  * @param {string} [input.runStatus] - run_status from the backend (missing = no run)
- * @param {boolean} [input.pendingStart] - true only right after the explicit Step 2 click
- * @returns {'attach'|'show_finished'|'start'|'show_idle'}
+ * @returns {'attach'|'show_finished'|'show_idle'}
  */
-export function decideStep3MountAction({ runStatus, pendingStart = false } = {}) {
+export function decideStep3MountAction({ runStatus } = {}) {
   if (runStatus === RUN_STATUS.RUNNING) return 'attach'
   if (isRunFinished(runStatus)) return 'show_finished'
-  if (pendingStart === true) return 'start'
   return 'show_idle'
 }

@@ -136,6 +136,95 @@ def safe_seed_posts(
     return publish, rejected
 
 
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?\u3002])\s+|\n+")
+
+PUBLIC_TEXT_WITHHELD = "public_text_withheld"
+PUBLIC_TEXT_STRIPPED = "public_text_stripped"
+
+
+def sanitize_public_text(text: str, private_texts: Iterable[str]) -> Tuple[str, str]:
+    """
+    Remove private research wording from text an agent is about to publish
+
+    Sentences that reproduce a private instruction are dropped; when nothing
+    publishable remains (or the rest still reproduces it) the text is withheld.
+    Factual product context is not private and is never touched here.
+
+    Returns:
+        (text to publish, verdict) with verdict "clean" | "stripped" | "withheld"
+    """
+    private_texts = [p for p in private_texts or [] if p]
+    if not text or not private_texts or not reproduces_private_text(text, private_texts):
+        return text, "clean"
+    kept = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text)
+            if p.strip() and not reproduces_private_text(p, private_texts)]
+    remaining = " ".join(kept).strip()
+    if len(_words(remaining)) < 3 or reproduces_private_text(remaining, private_texts):
+        return "", "withheld"
+    return remaining, "stripped"
+
+
+# OASIS platform actions that persist agent-authored public text:
+# name -> (text from the action message, message with replaced text)
+_GUARDED_ACTIONS = {
+    "create_post": (lambda m: m, lambda m, text: text),
+    "create_comment": (lambda m: m[1], lambda m, text: (m[0], text)),
+    "quote_post": (lambda m: m[1], lambda m, text: (m[0], text)),
+}
+
+
+def install_public_text_guard(platform: Any, private_texts: Iterable[str], on_event: Any = None) -> List[str]:
+    """
+    Guard an OASIS platform so private instructions never reach its database
+
+    Wraps the platform actions that write public text (post, comment, quote). The
+    check runs BEFORE OASIS inserts anything: withheld content is never persisted
+    (the action fails for the agent), stripped content is persisted without the
+    private sentences. The wrappers keep OASIS's dispatch signature
+    (self, agent_id, message).
+
+    Args:
+        platform: oasis Platform instance (env.platform)
+        private_texts: Private instruction texts of the run
+        on_event: Optional callable(event_type, agent_id, action, removed_chars)
+
+    Returns:
+        Names of the guarded actions
+    """
+    import types
+
+    private_texts = [p for p in private_texts or [] if p]
+    guarded_names = []
+    if not private_texts:
+        return guarded_names
+    for name, (extract, rebuild) in _GUARDED_ACTIONS.items():
+        original = getattr(platform, name, None)
+        if original is None or getattr(original, "_mirofish_guarded", False):
+            continue
+
+        def make(original=original, name=name, extract=extract, rebuild=rebuild):
+            async def guarded(self, agent_id, message):
+                try:
+                    text = extract(message)
+                except Exception:
+                    text = None
+                if not isinstance(text, str):
+                    return await original(agent_id, message)
+                clean, verdict = sanitize_public_text(text, private_texts)
+                if verdict != "clean" and on_event:
+                    on_event(PUBLIC_TEXT_WITHHELD if verdict == "withheld" else PUBLIC_TEXT_STRIPPED,
+                             agent_id, name, len(text) - len(clean))
+                if verdict == "withheld":
+                    return {"success": False, "error": "Content withheld: it reproduces private research context"}
+                return await original(agent_id, rebuild(message, clean) if verdict == "stripped" else message)
+            guarded._mirofish_guarded = True
+            return guarded
+
+        setattr(platform, name, types.MethodType(make(), platform))
+        guarded_names.append(name)
+    return guarded_names
+
+
 def classify_origin(action: Dict[str, Any], private_texts: Iterable[str]) -> Tuple[str, Optional[str]]:
     """
     Origin of an action read from the OASIS trace after an LLM step
@@ -148,6 +237,39 @@ def classify_origin(action: Dict[str, Any], private_texts: Iterable[str]) -> Tup
         if content and reproduces_private_text(content, private_texts):
             return ORIGIN_RESEARCHER_INSTRUCTION, "instruction_leak"
     return ORIGIN_AGENT_GENERATED, None
+
+
+CONTRACT_FILE = "run_contract.json"
+
+
+def resolve_total_rounds(config: Dict[str, Any], simulation_dir: str, max_rounds: Optional[int] = None) -> Tuple[int, str]:
+    """
+    Number of rounds a run executes
+
+    A contracted run (run_contract.json next to the config) executes exactly the
+    contract's max_rounds; a different --max-rounds is an error. Otherwise the
+    generated time_config decides, truncated by max_rounds.
+
+    Returns:
+        (total_rounds, source) with source "run_contract" | "time_config" | "max_rounds"
+
+    Raises:
+        ValueError: contract without a valid max_rounds, or a conflicting max_rounds
+    """
+    path = os.path.join(simulation_dir, CONTRACT_FILE)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            rounds = (json.load(f).get("contract") or {}).get("max_rounds")
+        if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds <= 0:
+            raise ValueError("run_contract.json has no valid max_rounds")
+        if max_rounds is not None and max_rounds > 0 and max_rounds != rounds:
+            raise ValueError(f"--max-rounds {max_rounds} conflicts with the Run Contract ({rounds})")
+        return rounds, "run_contract"
+    time_config = config.get("time_config", {})
+    total_rounds = (time_config.get("total_simulation_hours", 72) * 60) // time_config.get("minutes_per_round", 30)
+    if max_rounds is not None and max_rounds > 0 and max_rounds < total_rounds:
+        return max_rounds, "max_rounds"
+    return total_rounds, "time_config"
 
 
 def max_trace_rowid(db_path: str) -> int:
@@ -345,6 +467,7 @@ class RunOrchestrator:
         self.action_logger = action_logger
         self.agent_names = {int(a["agent_id"]): a.get("entity_name") for a in config.get("agent_configs", [])
                             if a.get("agent_id") is not None}
+        self.current_round = 0
 
     def seed_posts(self) -> List[Dict[str, Any]]:
         posts, rejected = safe_seed_posts(self.config, self.private_texts, self.plan.get("seed_blocked_terms"))
@@ -364,6 +487,7 @@ class RunOrchestrator:
             round_num: Current round (>= 1)
             get_agent: callable(agent_id) -> OASIS agent
         """
+        self.current_round = round_num
         activated = []
         for d in self.scheduler.due(round_num):
             status, error = "delivered", None
@@ -381,6 +505,20 @@ class RunOrchestrator:
                     delivery="agent_memory", status=status, error=error,
                 )
         return activated
+
+    def guard_platform(self, platform: Any) -> List[str]:
+        """Install the pre-persistence leak guard on an OASIS platform (see install_public_text_guard)"""
+
+        def on_event(event_type, agent_id, action, removed_chars):
+            if self.action_logger:
+                # The withheld text itself is never logged
+                self.action_logger.log_event(
+                    event_type, round_num=self.current_round, origin=ORIGIN_ORCHESTRATION,
+                    agent_id=agent_id, agent_name=self.agent_names.get(agent_id), action=action,
+                    removed_chars=removed_chars,
+                )
+
+        return install_public_text_guard(platform, self.private_texts, on_event)
 
     def classify(self, action: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         return classify_origin(action, self.private_texts)

@@ -14,6 +14,15 @@ logger = get_logger("mirofish.assessment")
 # Uploaded documents whose filename marks them as (part of) the assessment brief
 BRIEF_FILENAME_RE = re.compile(r"assessment|brief|opdracht|instructie|instruction", re.IGNORECASE)
 
+# Uploaded documents whose filename marks them as the Run Contract (control plane,
+# never world knowledge and never part of the brief; see services/run_contract.py)
+CONTRACT_FILENAME_RE = re.compile(r"run[-_ ]?contract", re.IGNORECASE)
+
+
+def is_run_contract_filename(name: Optional[str]) -> bool:
+    """Whether an uploaded filename marks the Run Contract control document"""
+    return bool(CONTRACT_FILENAME_RE.search(name or ""))
+
 # Generic funnel fields used only when the brief does not define its own
 DEFAULT_FUNNEL_FIELDS = [
     "exposure",
@@ -94,6 +103,8 @@ def compose_brief(
     brief_docs = []
     for doc in source_documents:
         name = doc.get("original_filename") or ""
+        if is_run_contract_filename(name):
+            continue
         if BRIEF_FILENAME_RE.search(name) and (doc.get("text") or "").strip():
             brief_docs.append(name)
             parts += ["", f"## Brief document: {name}", "", doc["text"].strip()]
